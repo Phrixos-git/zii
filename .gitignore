@@ -1,0 +1,31 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs and temporary data
+logs/
+*.log
+tmp/
+.cache/
+coverage/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Go build and test artifacts
+/zii
+/bin/
+/dist/
+*.test
+coverage.out
+
