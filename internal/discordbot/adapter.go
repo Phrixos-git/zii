@@ -46,16 +46,17 @@ type Processor interface {
 var ErrReplyDelivery = errors.New("discordbot: reply delivery failed")
 
 type Adapter struct {
-	processor  Processor
-	queue      *orchestrator.RequestQueue
-	sender     ReplySender
-	maxChars   int
-	maxRetries int
-	mu         sync.Mutex
-	inFlight   map[string]struct{}
-	limiters   map[string]userLimiter
-	closed     bool
-	active     sync.WaitGroup
+	processor   Processor
+	queue       *orchestrator.RequestQueue
+	sender      ReplySender
+	maxChars    int
+	maxRetries  int
+	outputGuard outputGuard
+	mu          sync.Mutex
+	inFlight    map[string]struct{}
+	limiters    map[string]userLimiter
+	closed      bool
+	active      sync.WaitGroup
 }
 
 type userLimiter struct {
@@ -63,7 +64,10 @@ type userLimiter struct {
 	lastSeen time.Time
 }
 
-type Config struct{ ReplyMaxChars, SendMaxRetries int }
+type Config struct {
+	ReplyMaxChars, SendMaxRetries int
+	BlockedOutputValues           []string
+}
 
 func New(processor Processor, queue *orchestrator.RequestQueue, sender ReplySender, cfg Config) (*Adapter, error) {
 	if processor == nil || queue == nil || sender == nil {
@@ -81,7 +85,7 @@ func New(processor Processor, queue *orchestrator.RequestQueue, sender ReplySend
 	if cfg.SendMaxRetries < 0 || cfg.SendMaxRetries > 10 {
 		return nil, errors.New("discordbot: send max retries must be between 0 and 10")
 	}
-	return &Adapter{processor: processor, queue: queue, sender: sender, maxChars: cfg.ReplyMaxChars, maxRetries: cfg.SendMaxRetries, inFlight: make(map[string]struct{}), limiters: make(map[string]userLimiter)}, nil
+	return &Adapter{processor: processor, queue: queue, sender: sender, maxChars: cfg.ReplyMaxChars, maxRetries: cfg.SendMaxRetries, outputGuard: newOutputGuard(cfg.BlockedOutputValues), inFlight: make(map[string]struct{}), limiters: make(map[string]userLimiter)}, nil
 }
 
 func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
@@ -144,6 +148,10 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 	}
 	started := time.Now()
 	err := a.processor.ProcessQueuedWith(ctx, a.queue, request, func(workCtx context.Context, result orchestrator.Reply) error {
+		if reason := a.outputGuard.reason(result.Content); reason != "" {
+			slog.Error("Discord reply blocked by output security guard", "component", "discord_bot", "event", "unsafe_output_blocked", "request_id", request.RequestID, "discord_message_id", msg.ID, "status", "blocked", "error_code", reason)
+			result.Content = unsafeOutputReply
+		}
 		chunks := splitMessage(result.Content, a.maxChars)
 		if len(chunks) == 0 {
 			return ErrReplyDelivery

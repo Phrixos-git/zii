@@ -177,7 +177,7 @@ func run() error {
 		_ = db.Close()
 		return err
 	}
-	adapter, err := discordbot.New(service, queue, gateway.Sender(), discordbot.Config{ReplyMaxChars: replyMax, SendMaxRetries: sendRetries})
+	adapter, err := discordbot.New(service, queue, gateway.Sender(), discordbot.Config{ReplyMaxChars: replyMax, SendMaxRetries: sendRetries, BlockedOutputValues: blockedOutputValues(dbPath)})
 	if err != nil {
 		_ = searchClient.Close()
 		_ = db.Close()
@@ -215,6 +215,26 @@ func run() error {
 		return fmt.Errorf("close SQLite: %w", dbErr)
 	}
 	return nil
+}
+
+func blockedOutputValues(dbPath string) []string {
+	values := []string{dbPath, "http://127.0.0.1:8080", "http://127.0.0.1:8081/mcp"}
+	for _, key := range []string{"LLM_BASE_URL", "SEARCH_MCP_URL"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			values = append(values, value)
+		}
+	}
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || strings.TrimSpace(value) == "" {
+			continue
+		}
+		name := strings.ToUpper(key)
+		if strings.Contains(name, "TOKEN") || strings.Contains(name, "API_KEY") || strings.Contains(name, "APIKEY") || strings.Contains(name, "PASSWORD") || strings.Contains(name, "PASSWD") || strings.Contains(name, "SECRET") || strings.Contains(name, "MASTER_KEY") || strings.Contains(name, "CREDENTIAL") || strings.Contains(name, "AUTH_KEY") {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func envDuration(name string, fallback time.Duration) (time.Duration, error) {

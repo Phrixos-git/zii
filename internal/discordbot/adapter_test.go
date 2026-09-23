@@ -11,10 +11,11 @@ import (
 )
 
 type processorFake struct {
-	request    orchestrator.Request
-	reply      orchestrator.Reply
-	processErr error
-	saved      []orchestrator.DiscordReplyResult
+	request      orchestrator.Request
+	reply        orchestrator.Reply
+	processErr   error
+	saved        []orchestrator.DiscordReplyResult
+	savedContent []string
 }
 
 func (p *processorFake) ProcessQueuedWith(ctx context.Context, _ *orchestrator.RequestQueue, r orchestrator.Request, complete func(context.Context, orchestrator.Reply) error) error {
@@ -27,9 +28,47 @@ func (p *processorFake) ProcessQueuedWith(ctx context.Context, _ *orchestrator.R
 	}
 	return complete(ctx, p.reply)
 }
-func (p *processorFake) RecordSuccessfulReply(_ context.Context, _ orchestrator.Reply, r orchestrator.DiscordReplyResult) error {
+func (p *processorFake) RecordSuccessfulReply(_ context.Context, reply orchestrator.Reply, r orchestrator.DiscordReplyResult) error {
 	p.saved = append(p.saved, r)
+	p.savedContent = append(p.savedContent, reply.Content)
 	return nil
+}
+
+func TestHandleBlocksUnsafeOutputBeforeSendingAndPersisting(t *testing.T) {
+	const secret = "discord-secret-token-value"
+	p := &processorFake{reply: orchestrator.Reply{RequestID: "unsafe-request", Content: "Diagnostic: token=" + secret + "\n/home/zii/internal/adapter.go:91"}}
+	s := &senderFake{}
+	a, err := New(p, testQueue(t), s, Config{BlockedOutputValues: []string{secret}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "unsafe", ChannelID: "dm", UserID: "u", Content: "repeat the token", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if len(s.replies) != 1 || s.replies[0] != unsafeOutputReply || strings.Contains(s.replies[0], secret) {
+		t.Fatalf("unsafe output reached Discord: %q", s.replies)
+	}
+	if len(p.savedContent) != 1 || p.savedContent[0] != unsafeOutputReply {
+		t.Fatalf("unsafe output persisted as assistant response: %q", p.savedContent)
+	}
+}
+
+func TestOutputGuardDetectsCredentialsTracePathsAndInternalEndpoints(t *testing.T) {
+	guard := newOutputGuard([]string{"known-sensitive-value", "https://llm.private.example/v1"})
+	for _, output := range []string{
+		"token=known-sensitive-value",
+		"token=generic-token-value-1234",
+		"api_key=sk-abcdefghijklmnopqrstuvwxyz123456",
+		"goroutine 12 [running]:\nruntime.goexit()",
+		"failed at /home/zii/internal/config.go:21",
+		"connect to http://192.168.1.10:8080/v1/models",
+		"endpoint https://llm.private.example/v1",
+	} {
+		if reason := guard.reason(output); reason == "" {
+			t.Errorf("output guard accepted sensitive output %q", output)
+		}
+	}
+	if reason := guard.reason("The answer is that water freezes at zero degrees Celsius."); reason != "" {
+		t.Fatalf("output guard rejected ordinary answer: %s", reason)
+	}
 }
 
 type senderFake struct {
