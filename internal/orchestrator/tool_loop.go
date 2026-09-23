@@ -47,9 +47,19 @@ type ToolLoop struct {
 	registry      ToolRegistry
 	budget        toolResultBudget
 	mcpRetryDelay time.Duration
+	llmSlots      chan struct{}
+	mcpSlots      chan struct{}
+	maxToolCalls  int
+	callLimits    map[string]int
 }
 
+type ToolLoopConfig struct{ MaxCalls, SearchLocalMaxCalls, SearchWebMaxCalls, FetchPageMaxCalls, LLMMaxConcurrency, MCPMaxConcurrency int }
+
 func NewToolLoop(client ChatClient, search SearchToolClient, registry ToolRegistry) (*ToolLoop, error) {
+	return NewToolLoopWithConfig(client, search, registry, ToolLoopConfig{MaxCalls: maxToolCallsPerRequest, SearchLocalMaxCalls: maxSearchLocalCalls, SearchWebMaxCalls: maxSearchWebCalls, FetchPageMaxCalls: maxFetchPageCalls, LLMMaxConcurrency: defaultLLMConcurrency, MCPMaxConcurrency: defaultMCPConcurrency})
+}
+
+func NewToolLoopWithConfig(client ChatClient, search SearchToolClient, registry ToolRegistry, cfg ToolLoopConfig) (*ToolLoop, error) {
 	if client == nil {
 		return nil, errors.New("orchestrator: LLM client is nil")
 	}
@@ -59,12 +69,28 @@ func NewToolLoop(client ChatClient, search SearchToolClient, registry ToolRegist
 	if registry == nil {
 		return nil, errors.New("orchestrator: tool registry is nil")
 	}
+	if cfg.MaxCalls < 1 || cfg.SearchLocalMaxCalls < 1 || cfg.SearchWebMaxCalls < 1 || cfg.FetchPageMaxCalls < 1 {
+		return nil, errors.New("orchestrator: tool call limits must be positive")
+	}
+	if cfg.LLMMaxConcurrency == 0 {
+		cfg.LLMMaxConcurrency = defaultLLMConcurrency
+	}
+	if cfg.MCPMaxConcurrency == 0 {
+		cfg.MCPMaxConcurrency = defaultMCPConcurrency
+	}
+	if cfg.LLMMaxConcurrency < 1 || cfg.MCPMaxConcurrency < 1 {
+		return nil, errors.New("orchestrator: concurrency limits must be positive")
+	}
 	return &ToolLoop{
 		llm:           client,
 		search:        search,
 		registry:      registry,
 		budget:        toolResultBudget{counter: client},
 		mcpRetryDelay: time.Second,
+		llmSlots:      make(chan struct{}, cfg.LLMMaxConcurrency),
+		mcpSlots:      make(chan struct{}, cfg.MCPMaxConcurrency),
+		maxToolCalls:  cfg.MaxCalls,
+		callLimits:    map[string]int{"search_local": cfg.SearchLocalMaxCalls, "search_web": cfg.SearchWebMaxCalls, "fetch_page": cfg.FetchPageMaxCalls},
 	}, nil
 }
 
@@ -85,8 +111,9 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 	callCounts := make(map[string]int)
 	totalCalls := 0
 	toolsDisabled := false
+	shortenedRetryUsed := false
 
-	for turn := 0; turn <= maxToolCallsPerRequest+1; turn++ {
+	for turn := 0; turn <= l.maxToolCalls+1; turn++ {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
@@ -94,8 +121,20 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		if !toolsDisabled {
 			definitions = l.registry.LLMTools()
 		}
+		select {
+		case l.llmSlots <- struct{}{}:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 		completion, err := l.llm.Chat(ctx, messages, definitions)
+		<-l.llmSlots
 		if err != nil {
+			if errors.Is(err, llm.ErrTruncated) && !shortenedRetryUsed {
+				shortenedRetryUsed = true
+				toolsDisabled = true
+				messages = prependConciseRetryInstruction(messages)
+				continue
+			}
 			return "", fmt.Errorf("orchestrator: LLM completion: %w", err)
 		}
 		switch completion.FinishReason {
@@ -116,7 +155,13 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 				return "", fmt.Errorf("orchestrator: expected one assistant tool call")
 			}
 		case "length":
-			return "", llm.ErrTruncated
+			if shortenedRetryUsed {
+				return "", llm.ErrTruncated
+			}
+			shortenedRetryUsed = true
+			toolsDisabled = true
+			messages = prependConciseRetryInstruction(messages)
+			continue
 		default:
 			return "", fmt.Errorf("orchestrator: unsupported LLM finish reason %q", completion.FinishReason)
 		}
@@ -134,14 +179,14 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		callCounts[callName]++
 
 		switch {
-		case toolsDisabled || totalCalls > maxToolCallsPerRequest:
+		case toolsDisabled || totalCalls > l.maxToolCalls:
 			toolsDisabled = true
 			toolContent = safeToolError("tool_limit_reached", false, "")
 		case argsErr != nil:
 			toolContent = safeToolError("invalid_argument", false, "")
 		case !l.registry.IsAllowed(callName):
 			toolContent = safeToolError("not_found", false, "")
-		case callCounts[callName] > toolCallLimit(callName):
+		case callCounts[callName] > l.callLimits[callName]:
 			toolContent = safeToolError("rate_limited", false, "")
 		default:
 			if err := l.registry.Validate(callName, arguments); err != nil {
@@ -179,25 +224,43 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		toolMessage := chat.Message{Role: "tool", ToolCallID: call.ID, Name: callName, Content: content}
 		messages = append(messages, toolMessage)
 		toolMessages = append(toolMessages, toolMessage)
-		if totalCalls >= maxToolCallsPerRequest {
+		if totalCalls >= l.maxToolCalls {
 			toolsDisabled = true
 		}
 	}
 	return "", errors.New("orchestrator: tool loop exceeded its inference limit")
 }
 
+func prependConciseRetryInstruction(messages []chat.Message) []chat.Message {
+	instruction := chat.Message{
+		Role:    "system",
+		Content: "The previous response was cut off. Give a complete, substantially shorter answer using only the information already available. Do not call tools again.",
+	}
+	return append([]chat.Message{instruction}, messages...)
+}
+
 func (l *ToolLoop) invoke(ctx context.Context, name string, arguments json.RawMessage) (searchmcp.ToolResult, error) {
+	select {
+	case l.mcpSlots <- struct{}{}:
+	case <-ctx.Done():
+		return searchmcp.ToolResult{}, ctx.Err()
+	}
 	result, err := l.search.Call(ctx, name, arguments)
 	if err == nil || ctx.Err() != nil || !isMCPTransportError(err) {
+		<-l.mcpSlots
 		return result, err
 	}
 	if err := waitContextDelay(ctx, l.mcpRetryDelay); err != nil {
+		<-l.mcpSlots
 		return searchmcp.ToolResult{}, err
 	}
 	if err := l.search.Reconnect(ctx); err != nil {
+		<-l.mcpSlots
 		return searchmcp.ToolResult{}, err
 	}
-	return l.search.Call(ctx, name, arguments)
+	result, err = l.search.Call(ctx, name, arguments)
+	<-l.mcpSlots
+	return result, err
 }
 
 func waitContextDelay(ctx context.Context, delay time.Duration) error {

@@ -1,0 +1,199 @@
+package orchestrator
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+var ErrBusy = errors.New("orchestrator: request queue is full")
+var ErrQueueWaitTimeout = errors.New("orchestrator: request queue wait timed out")
+var ErrQueueClosed = errors.New("orchestrator: request queue is closed")
+
+const (
+	defaultQueueSize      = 10
+	defaultQueueWait      = 180 * time.Second
+	defaultRequestTimeout = 300 * time.Second
+	defaultLLMConcurrency = 2
+	defaultMCPConcurrency = 4
+)
+
+type queuedRequest struct {
+	ctx     context.Context
+	key     string
+	started time.Time
+	work    func(context.Context) error
+	result  chan error
+}
+
+// RequestQueue dispatches FIFO work while preventing overlapping work for a
+// single conversation key. Different conversations may run concurrently.
+type RequestQueue struct {
+	mu             sync.Mutex
+	queue          []*queuedRequest
+	active         map[string]context.CancelFunc
+	closed         bool
+	maxQueued      int
+	maxRunning     int
+	queueWait      time.Duration
+	requestTimeout time.Duration
+	wake           chan struct{}
+	running        sync.WaitGroup
+}
+
+type QueueConfig struct {
+	MaxQueued, MaxRunning     int
+	QueueWait, RequestTimeout time.Duration
+}
+
+func NewRequestQueue(cfg QueueConfig) (*RequestQueue, error) {
+	if cfg.MaxQueued == 0 {
+		cfg.MaxQueued = defaultQueueSize
+	}
+	if cfg.MaxRunning == 0 {
+		cfg.MaxRunning = 10
+	}
+	if cfg.QueueWait == 0 {
+		cfg.QueueWait = defaultQueueWait
+	}
+	if cfg.RequestTimeout == 0 {
+		cfg.RequestTimeout = defaultRequestTimeout
+	}
+	if cfg.MaxQueued < 1 || cfg.MaxRunning < 1 || cfg.QueueWait <= 0 || cfg.RequestTimeout <= 0 {
+		return nil, errors.New("orchestrator: invalid queue configuration")
+	}
+	q := &RequestQueue{active: make(map[string]context.CancelFunc), maxQueued: cfg.MaxQueued, maxRunning: cfg.MaxRunning, queueWait: cfg.QueueWait, requestTimeout: cfg.RequestTimeout, wake: make(chan struct{}, 1)}
+	go q.dispatch()
+	return q, nil
+}
+
+func (q *RequestQueue) Submit(ctx context.Context, conversationKey string, work func(context.Context) error) error {
+	if q == nil || ctx == nil || work == nil || conversationKey == "" {
+		return errors.New("orchestrator: invalid queued request")
+	}
+	job := &queuedRequest{ctx: ctx, key: conversationKey, started: time.Now(), work: work, result: make(chan error, 1)}
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return ErrQueueClosed
+	}
+	if len(q.queue) >= q.maxQueued {
+		q.mu.Unlock()
+		return ErrBusy
+	}
+	q.queue = append(q.queue, job)
+	q.mu.Unlock()
+	q.signal()
+	timer := time.NewTimer(q.queueWait)
+	defer timer.Stop()
+	select {
+	case err := <-job.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ErrQueueWaitTimeout
+	}
+}
+
+func (q *RequestQueue) signal() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *RequestQueue) dispatch() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	running := 0
+	for {
+		q.mu.Lock()
+		for i := 0; i < len(q.queue); {
+			job := q.queue[i]
+			if job.ctx.Err() != nil || time.Since(job.started) >= q.queueWait {
+				q.queue = append(q.queue[:i], q.queue[i+1:]...)
+				if job.ctx.Err() != nil {
+					job.result <- job.ctx.Err()
+				} else {
+					job.result <- ErrQueueWaitTimeout
+				}
+				continue
+			}
+			i++
+		}
+		for running < q.maxRunning {
+			idx := -1
+			for i, job := range q.queue {
+				if _, busy := q.active[job.key]; !busy {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				break
+			}
+			job := q.queue[idx]
+			q.queue = append(q.queue[:idx], q.queue[idx+1:]...)
+			workCtx, cancel := context.WithTimeout(job.ctx, q.requestTimeout)
+			q.active[job.key] = cancel
+			running++
+			q.running.Add(1)
+			go func(job *queuedRequest) {
+				err := job.work(workCtx)
+				cancel()
+				job.result <- err
+				q.mu.Lock()
+				delete(q.active, job.key)
+				q.mu.Unlock()
+				q.running.Done()
+				q.signal()
+				q.mu.Lock()
+				running--
+				q.mu.Unlock()
+			}(job)
+		}
+		closed := q.closed && len(q.queue) == 0 && running == 0
+		q.mu.Unlock()
+		if closed {
+			return
+		}
+		select {
+		case <-q.wake:
+		case <-ticker.C:
+		}
+	}
+}
+
+// Shutdown stops intake, cancels queued work, and waits up to grace for active work.
+func (q *RequestQueue) Shutdown(ctx context.Context) error {
+	if q == nil {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("orchestrator: shutdown context is nil")
+	}
+	q.mu.Lock()
+	q.closed = true
+	for _, job := range q.queue {
+		job.result <- ErrQueueClosed
+	}
+	q.queue = nil
+	q.mu.Unlock()
+	q.signal()
+	done := make(chan struct{})
+	go func() { q.running.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		q.mu.Lock()
+		for _, cancel := range q.active {
+			cancel()
+		}
+		q.mu.Unlock()
+		<-done
+		return ctx.Err()
+	}
+}

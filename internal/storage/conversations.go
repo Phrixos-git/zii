@@ -26,7 +26,8 @@ var ErrDuplicateDiscordMessage = errors.New("storage: duplicate Discord message"
 // opened through OpenSQLite so foreign keys and IMMEDIATE transactions are
 // enabled for every connection.
 type Repository struct {
-	db *sql.DB
+	db  *sql.DB
+	ttl time.Duration
 }
 
 // NewRepository creates a repository for an initialized SQLite database.
@@ -34,7 +35,17 @@ func NewRepository(db *sql.DB) (*Repository, error) {
 	if db == nil {
 		return nil, errors.New("storage: database is nil")
 	}
-	return &Repository{db: db}, nil
+	return NewRepositoryWithTTL(db, conversationTTL)
+}
+
+func NewRepositoryWithTTL(db *sql.DB, ttl time.Duration) (*Repository, error) {
+	if db == nil {
+		return nil, errors.New("storage: database is nil")
+	}
+	if ttl <= 0 {
+		return nil, errors.New("storage: conversation TTL must be positive")
+	}
+	return &Repository{db: db, ttl: ttl}, nil
 }
 
 // UserMessage contains the Discord-derived fields needed to persist an
@@ -140,7 +151,11 @@ func (r *Repository) recordUserMessageOnce(ctx context.Context, in UserMessage, 
 
 	lookup := `SELECT id FROM conversations
 		WHERE scope_id = ? AND user_id = ? AND last_active_at > ?`
-	args := []any{in.ScopeID, in.UserID, formatSQLiteTime(now.Add(-conversationTTL))}
+	ttl := r.ttl
+	if ttl <= 0 {
+		ttl = conversationTTL
+	}
+	args := []any{in.ScopeID, in.UserID, formatSQLiteTime(now.Add(-ttl))}
 	if in.GuildID == nil {
 		lookup += ` AND guild_id IS NULL`
 	} else {

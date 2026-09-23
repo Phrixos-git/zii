@@ -16,6 +16,7 @@ import (
 
 type fakeLoopLLM struct {
 	responses   []llm.Completion
+	chatErrors  []error
 	requests    [][]chat.Message
 	definitions [][]llm.ToolDefinition
 }
@@ -23,6 +24,13 @@ type fakeLoopLLM struct {
 func (f *fakeLoopLLM) Chat(_ context.Context, messages []chat.Message, tools []llm.ToolDefinition) (llm.Completion, error) {
 	f.requests = append(f.requests, append([]chat.Message(nil), messages...))
 	f.definitions = append(f.definitions, append([]llm.ToolDefinition(nil), tools...))
+	if len(f.chatErrors) > 0 {
+		err := f.chatErrors[0]
+		f.chatErrors = f.chatErrors[1:]
+		if err != nil {
+			return llm.Completion{}, err
+		}
+	}
 	if len(f.responses) == 0 {
 		return llm.Completion{}, errors.New("unexpected LLM call")
 	}
@@ -302,6 +310,33 @@ func TestToolLoopPropagatesTokenizerFailure(t *testing.T) {
 	loop, _ := NewToolLoop(llmClient, &fakeLoopSearch{}, newTestRegistry(t))
 	if _, err := loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "q"}}); err == nil || !strings.Contains(err.Error(), "tokenizer") {
 		t.Fatalf("Run error = %v, want tokenizer error", err)
+	}
+}
+
+func TestToolLoopRetriesTruncationOnceWithConcisePrompt(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{
+		chatErrors: []error{llm.ErrTruncated},
+		responses:  []llm.Completion{{FinishReason: "stop", Message: chat.Message{Role: "assistant", Content: "short complete answer"}}},
+	}
+	loop, _ := NewToolLoop(fakeLLM, &fakeLoopSearch{}, newTestRegistry(t))
+	answer, err := loop.Run(context.Background(), []chat.Message{{Role: "system", Content: "rules"}, {Role: "user", Content: "q"}})
+	if err != nil || answer != "short complete answer" {
+		t.Fatalf("Run = %q, %v", answer, err)
+	}
+	if len(fakeLLM.requests) != 2 || len(fakeLLM.definitions[1]) != 0 || !strings.Contains(fakeLLM.requests[1][0].Content, "substantially shorter") {
+		t.Fatalf("shortened retry request = %+v; tools=%d", fakeLLM.requests[1], len(fakeLLM.definitions[1]))
+	}
+}
+
+func TestToolLoopStopsAfterSecondTruncation(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{chatErrors: []error{llm.ErrTruncated, llm.ErrTruncated}}
+	loop, _ := NewToolLoop(fakeLLM, &fakeLoopSearch{}, newTestRegistry(t))
+	_, err := loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "q"}})
+	if !errors.Is(err, llm.ErrTruncated) {
+		t.Fatalf("Run error = %v, want ErrTruncated", err)
+	}
+	if len(fakeLLM.requests) != 2 {
+		t.Fatalf("LLM request count = %d, want exactly 2", len(fakeLLM.requests))
 	}
 }
 
