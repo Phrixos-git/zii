@@ -146,8 +146,16 @@ func (s *Service) Process(ctx context.Context, request Request) (Reply, error) {
 // ProcessQueued submits work using the stable conversation key components
 // available before SQLite resolves the active conversation row.
 func (s *Service) ProcessQueued(ctx context.Context, queue *RequestQueue, request Request) (Reply, error) {
+	var reply Reply
+	err := s.ProcessQueuedWith(ctx, queue, request, func(_ context.Context, result Reply) error { reply = result; return nil })
+	return reply, err
+}
+
+// ProcessQueuedWith holds the conversation key until complete returns, so
+// reply delivery and assistant persistence remain ordered with later turns.
+func (s *Service) ProcessQueuedWith(ctx context.Context, queue *RequestQueue, request Request, complete func(context.Context, Reply) error) error {
 	if queue == nil {
-		return Reply{}, errors.New("orchestrator: request queue is nil")
+		return errors.New("orchestrator: request queue is nil")
 	}
 	scopeID := request.ChannelID
 	if strings.TrimSpace(request.ThreadID) != "" {
@@ -158,13 +166,18 @@ func (s *Service) ProcessQueued(ctx context.Context, queue *RequestQueue, reques
 		guildID = *request.GuildID
 	}
 	key := fmt.Sprintf("%d:%s%d:%s%d:%s", len(guildID), guildID, len(scopeID), scopeID, len(request.UserID), request.UserID)
-	var reply Reply
 	err := queue.Submit(ctx, key, func(workCtx context.Context) error {
-		var err error
-		reply, err = s.Process(workCtx, request)
-		return err
+		workCtx = withRequestID(workCtx, request.RequestID)
+		reply, err := s.Process(workCtx, request)
+		if err != nil {
+			return err
+		}
+		if complete != nil {
+			return complete(workCtx, reply)
+		}
+		return nil
 	})
-	return reply, err
+	return err
 }
 
 // RecordSuccessfulReply persists the answer only after the adapter confirms a

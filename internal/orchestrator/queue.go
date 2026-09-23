@@ -20,11 +20,12 @@ const (
 )
 
 type queuedRequest struct {
-	ctx     context.Context
-	key     string
-	started time.Time
-	work    func(context.Context) error
-	result  chan error
+	ctx        context.Context
+	key        string
+	enqueuedAt time.Time
+	started    chan struct{}
+	work       func(context.Context) error
+	result     chan error
 }
 
 // RequestQueue dispatches FIFO work while preventing overlapping work for a
@@ -72,7 +73,6 @@ func (q *RequestQueue) Submit(ctx context.Context, conversationKey string, work 
 	if q == nil || ctx == nil || work == nil || conversationKey == "" {
 		return errors.New("orchestrator: invalid queued request")
 	}
-	job := &queuedRequest{ctx: ctx, key: conversationKey, started: time.Now(), work: work, result: make(chan error, 1)}
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
@@ -82,6 +82,9 @@ func (q *RequestQueue) Submit(ctx context.Context, conversationKey string, work 
 		q.mu.Unlock()
 		return ErrBusy
 	}
+	requestCtx, cancel := context.WithTimeout(ctx, q.requestTimeout)
+	defer cancel()
+	job := &queuedRequest{ctx: requestCtx, key: conversationKey, enqueuedAt: time.Now(), started: make(chan struct{}), work: work, result: make(chan error, 1)}
 	q.queue = append(q.queue, job)
 	q.mu.Unlock()
 	q.signal()
@@ -90,10 +93,23 @@ func (q *RequestQueue) Submit(ctx context.Context, conversationKey string, work 
 	select {
 	case err := <-job.result:
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-requestCtx.Done():
+		return requestCtx.Err()
 	case <-timer.C:
-		return ErrQueueWaitTimeout
+		select {
+		case <-job.started:
+			return <-job.result
+		default:
+			return ErrQueueWaitTimeout
+		}
+	case <-job.started:
+		timer.Stop()
+		select {
+		case err := <-job.result:
+			return err
+		case <-requestCtx.Done():
+			return requestCtx.Err()
+		}
 	}
 }
 
@@ -112,7 +128,7 @@ func (q *RequestQueue) dispatch() {
 		q.mu.Lock()
 		for i := 0; i < len(q.queue); {
 			job := q.queue[i]
-			if job.ctx.Err() != nil || time.Since(job.started) >= q.queueWait {
+			if job.ctx.Err() != nil || time.Since(job.enqueuedAt) >= q.queueWait {
 				q.queue = append(q.queue[:i], q.queue[i+1:]...)
 				if job.ctx.Err() != nil {
 					job.result <- job.ctx.Err()
@@ -136,6 +152,7 @@ func (q *RequestQueue) dispatch() {
 			}
 			job := q.queue[idx]
 			q.queue = append(q.queue[:idx], q.queue[idx+1:]...)
+			close(job.started)
 			workCtx, cancel := context.WithTimeout(job.ctx, q.requestTimeout)
 			q.active[job.key] = cancel
 			running++

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
@@ -126,9 +127,11 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
+		started := time.Now()
 		completion, err := l.llm.Chat(ctx, messages, definitions)
 		<-l.llmSlots
 		if err != nil {
+			slog.Warn("LLM request failed", "component", "orchestrator", "event", "llm_request_failed", "request_id", RequestIDFromContext(ctx), "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "llm_error")
 			if errors.Is(err, llm.ErrTruncated) && !shortenedRetryUsed {
 				shortenedRetryUsed = true
 				toolsDisabled = true
@@ -137,6 +140,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			}
 			return "", fmt.Errorf("orchestrator: LLM completion: %w", err)
 		}
+		slog.Info("LLM request completed", "component", "orchestrator", "event", "llm_request_completed", "request_id", RequestIDFromContext(ctx), "duration_ms", time.Since(started).Milliseconds(), "status", "success")
 		switch completion.FinishReason {
 		case "stop":
 			if completion.Message.Role != "assistant" {
@@ -240,6 +244,7 @@ func prependConciseRetryInstruction(messages []chat.Message) []chat.Message {
 }
 
 func (l *ToolLoop) invoke(ctx context.Context, name string, arguments json.RawMessage) (searchmcp.ToolResult, error) {
+	started := time.Now()
 	select {
 	case l.mcpSlots <- struct{}{}:
 	case <-ctx.Done():
@@ -248,19 +253,35 @@ func (l *ToolLoop) invoke(ctx context.Context, name string, arguments json.RawMe
 	result, err := l.search.Call(ctx, name, arguments)
 	if err == nil || ctx.Err() != nil || !isMCPTransportError(err) {
 		<-l.mcpSlots
+		logToolCall(ctx, name, started, err)
 		return result, err
 	}
 	if err := waitContextDelay(ctx, l.mcpRetryDelay); err != nil {
 		<-l.mcpSlots
+		logToolCall(ctx, name, started, err)
 		return searchmcp.ToolResult{}, err
 	}
 	if err := l.search.Reconnect(ctx); err != nil {
 		<-l.mcpSlots
+		logToolCall(ctx, name, started, err)
 		return searchmcp.ToolResult{}, err
 	}
 	result, err = l.search.Call(ctx, name, arguments)
 	<-l.mcpSlots
+	logToolCall(ctx, name, started, err)
 	return result, err
+}
+
+func logToolCall(ctx context.Context, name string, started time.Time, err error) {
+	status := "success"
+	level := slog.LevelInfo
+	code := ""
+	if err != nil {
+		status = "failed"
+		level = slog.LevelWarn
+		code = "search_mcp_error"
+	}
+	slog.Log(ctx, level, "Search MCP tool call completed", "component", "orchestrator", "event", "tool_call_completed", "request_id", RequestIDFromContext(ctx), "tool_name", name, "duration_ms", time.Since(started).Milliseconds(), "status", status, "error_code", code)
 }
 
 func waitContextDelay(ctx context.Context, delay time.Duration) error {
