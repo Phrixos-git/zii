@@ -183,6 +183,9 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 			code = "queue_timeout"
 		}
 		slog.Warn("Discord request failed", "component", "discord_bot", "event", "request_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "guild_id", msg.GuildID, "channel_id", msg.ChannelID, "user_id", msg.UserID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", code)
+		if ctx.Err() != nil {
+			return
+		}
 		_ = a.sendChunks(ctx, msg.ID, replyChannelID, "処理中にエラーが発生しました。時間をおいてもう一度試してください。")
 		return
 	}

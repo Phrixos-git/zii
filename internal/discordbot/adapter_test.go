@@ -117,6 +117,18 @@ func TestHandleDMAndRejectsBotsWebhookAndInvalidInput(t *testing.T) {
 	}
 }
 
+func TestHandleDoesNotSendErrorReplyAfterCancellation(t *testing.T) {
+	p := &processorFake{processErr: errors.New("request failed")}
+	s := &senderFake{}
+	a, _ := New(p, testQueue(t), s, Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.Handle(ctx, Incoming{ID: "m", ChannelID: "c", UserID: "u", Content: "q", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if len(s.replies) != 0 {
+		t.Fatalf("replies after cancellation = %v", s.replies)
+	}
+}
+
 func TestLongReplySavesFirstReplyOnlyAfterAllChunksSucceed(t *testing.T) {
 	p := &processorFake{reply: orchestrator.Reply{RequestID: "r", ReplyToMessageID: "q", Content: strings.Repeat("a", 2000)}}
 	s := &senderFake{}
