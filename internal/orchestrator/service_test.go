@@ -74,11 +74,31 @@ func TestServiceProcessPersistsCurrentMessageAndDefersAssistantPersistence(t *te
 	if len(chatClient.requests) != 1 || chatClient.requests[0][1].Content != "prior question" || chatClient.requests[0][2].Content != "prior answer" || chatClient.requests[0][3].Content != "current question" {
 		t.Fatalf("LLM context = %+v", chatClient.requests)
 	}
-	if err := service.RecordSuccessfulReply(context.Background(), reply, DiscordReplyResult{RequestID: "request-1", DiscordMessageID: "bot-1", CreatedAt: fixedNow.Add(time.Second)}); err != nil {
+	if err := service.RecordSuccessfulReply(context.Background(), reply, DiscordReplyResult{RequestID: "request-1", Success: true, DiscordMessageID: "bot-1", CreatedAt: fixedNow.Add(time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	if repo.assistant == nil || repo.assistant.ConversationID != "conversation-1" || repo.assistant.DiscordMessageID != "bot-1" || repo.assistant.Content != "answer" {
 		t.Fatalf("assistant message = %+v", repo.assistant)
+	}
+}
+
+func TestServiceDoesNotPersistUnsuccessfulDiscordReply(t *testing.T) {
+	repo := &serviceRepo{conversationID: "c"}
+	client := &serviceChat{result: "answer"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, err := NewService(repo, client, loop, ServiceConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Process(context.Background(), Request{RequestID: "r", DiscordMessageID: "d", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordSuccessfulReply(context.Background(), Reply{}, DiscordReplyResult{RequestID: "r", Success: false}); err != nil {
+		t.Fatalf("unsuccessful reply should be a no-op: %v", err)
+	}
+	if repo.assistant != nil {
+		t.Fatalf("unsuccessful Discord reply was persisted: %+v", repo.assistant)
 	}
 }
 

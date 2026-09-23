@@ -36,6 +36,14 @@ type Completion struct {
 	FinishReason string
 }
 
+// Close releases idle connections owned by the HTTP client during shutdown.
+func (c *Client) Close() error {
+	if c != nil && c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
+	return nil
+}
+
 type chatRequest struct {
 	Model             string         `json:"model"`
 	Messages          []chat.Message `json:"messages"`

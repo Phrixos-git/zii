@@ -46,17 +46,20 @@ type Processor interface {
 var ErrReplyDelivery = errors.New("discordbot: reply delivery failed")
 
 type Adapter struct {
-	processor   Processor
-	queue       *orchestrator.RequestQueue
-	sender      ReplySender
-	maxChars    int
-	maxRetries  int
-	outputGuard outputGuard
-	mu          sync.Mutex
-	inFlight    map[string]struct{}
-	limiters    map[string]userLimiter
-	closed      bool
-	active      sync.WaitGroup
+	processor    Processor
+	queue        *orchestrator.RequestQueue
+	sender       ReplySender
+	maxChars     int
+	maxRetries   int
+	outputGuard  outputGuard
+	clock        func() time.Time
+	newRequestID func() string
+	wait         func(context.Context, time.Duration) error
+	mu           sync.Mutex
+	inFlight     map[string]struct{}
+	limiters     map[string]userLimiter
+	closed       bool
+	active       sync.WaitGroup
 }
 
 type userLimiter struct {
@@ -67,6 +70,9 @@ type userLimiter struct {
 type Config struct {
 	ReplyMaxChars, SendMaxRetries int
 	BlockedOutputValues           []string
+	Clock                         func() time.Time
+	RequestIDGenerator            func() string
+	Wait                          func(context.Context, time.Duration) error
 }
 
 func New(processor Processor, queue *orchestrator.RequestQueue, sender ReplySender, cfg Config) (*Adapter, error) {
@@ -85,7 +91,16 @@ func New(processor Processor, queue *orchestrator.RequestQueue, sender ReplySend
 	if cfg.SendMaxRetries < 0 || cfg.SendMaxRetries > 10 {
 		return nil, errors.New("discordbot: send max retries must be between 0 and 10")
 	}
-	return &Adapter{processor: processor, queue: queue, sender: sender, maxChars: cfg.ReplyMaxChars, maxRetries: cfg.SendMaxRetries, outputGuard: newOutputGuard(cfg.BlockedOutputValues), inFlight: make(map[string]struct{}), limiters: make(map[string]userLimiter)}, nil
+	if cfg.Clock == nil {
+		cfg.Clock = time.Now
+	}
+	if cfg.RequestIDGenerator == nil {
+		cfg.RequestIDGenerator = uuid.NewString
+	}
+	if cfg.Wait == nil {
+		cfg.Wait = wait
+	}
+	return &Adapter{processor: processor, queue: queue, sender: sender, maxChars: cfg.ReplyMaxChars, maxRetries: cfg.SendMaxRetries, outputGuard: newOutputGuard(cfg.BlockedOutputValues), clock: cfg.Clock, newRequestID: cfg.RequestIDGenerator, wait: cfg.Wait, inFlight: make(map[string]struct{}), limiters: make(map[string]userLimiter)}, nil
 }
 
 func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
@@ -108,7 +123,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 		return
 	}
 	if msg.ReceivedAt.IsZero() {
-		msg.ReceivedAt = time.Now().UTC()
+		msg.ReceivedAt = a.clock().UTC()
 	}
 	a.mu.Lock()
 	if a.closed {
@@ -123,10 +138,10 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 	if !ok {
 		entry = userLimiter{limiter: rate.NewLimiter(userRate, 2)}
 	}
-	entry.lastSeen = time.Now()
+	entry.lastSeen = a.clock()
 	a.limiters[msg.UserID] = entry
 	if len(a.limiters) > 4096 {
-		cutoff := time.Now().Add(-time.Minute)
+		cutoff := a.clock().Add(-time.Minute)
 		for id, old := range a.limiters {
 			if old.lastSeen.Before(cutoff) {
 				delete(a.limiters, id)
@@ -141,12 +156,17 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 	a.active.Add(1)
 	a.mu.Unlock()
 	defer func() { a.mu.Lock(); delete(a.inFlight, msg.ID); a.mu.Unlock(); a.active.Done() }()
-	request := orchestrator.Request{RequestID: uuid.NewString(), DiscordMessageID: msg.ID, GuildID: nullable(msg.GuildID), ChannelID: msg.ChannelID, ThreadID: msg.ThreadID, UserID: msg.UserID, Content: msg.Content, MessageCreatedAt: msg.CreatedAt.UTC(), ReceivedAt: msg.ReceivedAt.UTC()}
+	requestID := a.newRequestID()
+	if strings.TrimSpace(requestID) == "" {
+		slog.Error("Discord request ID generation failed", "component", "discord_bot", "event", "request_failed", "discord_message_id", msg.ID, "status", "failed", "error_code", "request_id_error")
+		return
+	}
+	request := orchestrator.Request{RequestID: requestID, DiscordMessageID: msg.ID, GuildID: nullable(msg.GuildID), ChannelID: msg.ChannelID, ThreadID: msg.ThreadID, UserID: msg.UserID, Content: msg.Content, MessageCreatedAt: msg.CreatedAt.UTC(), ReceivedAt: msg.ReceivedAt.UTC()}
 	replyChannelID := msg.ChannelID
 	if msg.ThreadID != "" {
 		replyChannelID = msg.ThreadID
 	}
-	started := time.Now()
+	started := a.clock()
 	err := a.processor.ProcessQueuedWith(ctx, a.queue, request, func(workCtx context.Context, result orchestrator.Reply) error {
 		if reason := a.outputGuard.reason(result.Content); reason != "" {
 			slog.Error("Discord reply blocked by output security guard", "component", "discord_bot", "event", "unsafe_output_blocked", "request_id", request.RequestID, "discord_message_id", msg.ID, "status", "blocked", "error_code", reason)
@@ -171,7 +191,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 				first = sent
 			}
 		}
-		if persistErr := a.processor.RecordSuccessfulReply(workCtx, result, orchestrator.DiscordReplyResult{RequestID: result.RequestID, DiscordMessageID: first.ID, CreatedAt: first.CreatedAt}); persistErr != nil {
+		if persistErr := a.processor.RecordSuccessfulReply(workCtx, result, orchestrator.DiscordReplyResult{RequestID: result.RequestID, Success: true, DiscordMessageID: first.ID, CreatedAt: first.CreatedAt}); persistErr != nil {
 			slog.Error("Discord reply persistence failed", "component", "discord_bot", "event", "assistant_persist_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "storage_error")
 			return fmt.Errorf("%w: persistence failed", ErrReplyDelivery)
 		}
@@ -246,11 +266,21 @@ func (a *Adapter) sendWithRetry(ctx context.Context, replyTo, channelID, content
 			return SentMessage{}, err
 		}
 		delay := time.Duration(1<<min(attempt, 2)) * time.Second
-		var retryAfter interface{ RetryAfter() time.Duration }
-		if errors.As(err, &retryAfter) && retryAfter.RetryAfter() > 0 {
+		var status interface{ StatusCode() int }
+		if errors.As(err, &status) && status.StatusCode() == 429 {
+			var retryAfter interface{ RetryAfter() time.Duration }
+			if !errors.As(err, &retryAfter) || retryAfter.RetryAfter() <= 0 {
+				return SentMessage{}, err
+			}
 			delay = retryAfter.RetryAfter()
 		}
-		if err := wait(ctx, delay); err != nil {
+		var retryAfter interface{ RetryAfter() time.Duration }
+		if errors.As(err, &retryAfter) && retryAfter.RetryAfter() > 0 {
+			if status == nil || status.StatusCode() != 429 {
+				delay = retryAfter.RetryAfter()
+			}
+		}
+		if err := a.wait(ctx, delay); err != nil {
 			return SentMessage{}, err
 		}
 	}
@@ -335,36 +365,103 @@ func splitMessage(text string, limit int) []string {
 	}
 	runes := []rune(text)
 	var out []string
-	for len(runes) > 0 {
-		end := len(runes)
-		if end > limit {
-			end = limit
-			cut := -1
-			for _, sep := range []rune{'\n', ' ', '。', '！', '？', '.', '!', '?'} {
-				for i := end - 1; i > 0; i-- {
-					if runes[i] == sep {
-						cut = i + 1
-						break
-					}
+	offset := 0
+	prefix := ""
+	for offset < len(runes) {
+		capacity := limit - utf8.RuneCountInString(prefix)
+		if capacity < 1 {
+			prefix = ""
+			capacity = limit
+		}
+		remaining := runes[offset:]
+		end := chooseSplitCut(remaining, capacity)
+		if end < 1 {
+			end = min(len(remaining), capacity)
+		}
+		fence := markdownFenceAt(runes[:offset+end], offset+end == len(runes))
+		suffix := ""
+		nextPrefix := ""
+		if fence != nil && offset+end < len(runes) {
+			fenceClose := "\n" + fence.marker
+			contentCapacity := capacity - utf8.RuneCountInString(fenceClose)
+			if contentCapacity > 0 {
+				end = chooseSplitCut(remaining, contentCapacity)
+				if end < 1 {
+					end = min(len(remaining), contentCapacity)
 				}
-				if cut > 0 {
-					break
+				fence = markdownFenceAt(runes[:offset+end], false)
+				if fence != nil && offset+end < len(runes) {
+					suffix = "\n" + fence.marker
+					nextPrefix = fence.opening + "\n"
 				}
-			}
-			if cut > 0 {
-				end = cut
 			}
 		}
-		part := strings.TrimSpace(string(runes[:end]))
-		if part != "" {
+		part := prefix + string(remaining[:end]) + suffix
+		if offset+end == len(runes) {
+			if fence := markdownFenceAt(runes[:offset+end], true); fence != nil {
+				closing := "\n" + fence.marker
+				if utf8.RuneCountInString(part+closing) <= limit {
+					part += closing
+				}
+			}
+		}
+		if strings.TrimSpace(part) != "" {
 			out = append(out, part)
 		}
-		runes = runes[end:]
-		for len(runes) > 0 && unicode.IsSpace(runes[0]) {
-			runes = runes[1:]
-		}
+		offset += end
+		prefix = nextPrefix
 	}
 	return out
+}
+
+func chooseSplitCut(runes []rune, capacity int) int {
+	if len(runes) <= capacity {
+		return len(runes)
+	}
+	end := capacity
+	for _, sep := range []rune{'\n', ' ', '。', '！', '？', '.', '!', '?'} {
+		for i := end - 1; i > 0; i-- {
+			if runes[i] == sep {
+				return i + 1
+			}
+		}
+	}
+	return end
+}
+
+type markdownFence struct {
+	marker  string
+	opening string
+}
+
+func markdownFenceAt(runes []rune, includeFinalLine bool) *markdownFence {
+	content := string(runes)
+	lines := strings.Split(content, "\n")
+	var open *markdownFence
+	for i, line := range lines {
+		if i == len(lines)-1 && !strings.HasSuffix(content, "\n") && !includeFinalLine {
+			break
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if len(trimmed) < 3 || (trimmed[0] != '`' && trimmed[0] != '~') {
+			continue
+		}
+		count := 0
+		for count < len(trimmed) && trimmed[count] == trimmed[0] {
+			count++
+		}
+		if count < 3 {
+			continue
+		}
+		if open == nil {
+			open = &markdownFence{marker: trimmed[:count], opening: trimmed}
+			continue
+		}
+		if trimmed[0] == open.marker[0] && count >= len(open.marker) && strings.TrimSpace(trimmed[count:]) == "" {
+			open = nil
+		}
+	}
+	return open
 }
 
 func (a *Adapter) String() string { return fmt.Sprintf("discordbot.Adapter(maxChars=%d)", a.maxChars) }

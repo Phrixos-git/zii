@@ -42,6 +42,7 @@ type Reply struct {
 // DiscordReplyResult is returned only after a successful Discord send.
 type DiscordReplyResult struct {
 	RequestID        string
+	Success          bool
 	DiscordMessageID string
 	CreatedAt        time.Time
 }
@@ -188,6 +189,9 @@ func (s *Service) RecordSuccessfulReply(ctx context.Context, reply Reply, result
 	}
 	if ctx == nil {
 		return errors.New("orchestrator: context is nil")
+	}
+	if !result.Success {
+		return nil
 	}
 	if reply.conversationID == "" || strings.TrimSpace(reply.RequestID) == "" || strings.TrimSpace(reply.Content) == "" {
 		return errors.New("orchestrator: pending reply is incomplete")

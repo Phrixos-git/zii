@@ -154,3 +154,53 @@ func TestRequestQueueCancelsWorkAtRequestDeadline(t *testing.T) {
 		t.Fatal("request deadline did not cancel work")
 	}
 }
+
+func TestRequestQueueShutdownCancelsUnstartedAndActiveRequests(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 2, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeStarted := make(chan struct{})
+	activeCanceled := make(chan struct{})
+	activeResult := make(chan error, 1)
+	go func() {
+		activeResult <- q.Submit(context.Background(), "active", func(ctx context.Context) error {
+			close(activeStarted)
+			<-ctx.Done()
+			close(activeCanceled)
+			return ctx.Err()
+		})
+	}()
+	<-activeStarted
+	queuedStarted := make(chan struct{}, 1)
+	queuedResult := make(chan error, 1)
+	go func() {
+		queuedResult <- q.Submit(context.Background(), "queued", func(context.Context) error {
+			queuedStarted <- struct{}{}
+			return nil
+		})
+	}()
+	time.Sleep(20 * time.Millisecond)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err = q.Shutdown(shutdownCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want grace deadline after cancel", err)
+	}
+	if err := <-activeResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("active request result = %v, want cancellation", err)
+	}
+	if err := <-queuedResult; !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("queued request result = %v, want ErrQueueClosed", err)
+	}
+	select {
+	case <-activeCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("active request was not canceled at shutdown deadline")
+	}
+	select {
+	case <-queuedStarted:
+		t.Fatal("unstarted request ran after shutdown")
+	default:
+	}
+}

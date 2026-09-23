@@ -204,6 +204,7 @@ func run() error {
 	queueErr := queue.Shutdown(graceCtx)
 	closeErr := gateway.Close()
 	_ = searchClient.Close()
+	_ = llmClient.Close()
 	dbErr := db.Close()
 	if queueErr != nil {
 		return fmt.Errorf("shutdown request queue: %w", queueErr)

@@ -3,6 +3,8 @@ package discordbot
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -72,21 +74,165 @@ func TestOutputGuardDetectsCredentialsTracePathsAndInternalEndpoints(t *testing.
 }
 
 type senderFake struct {
-	replies  []string
-	channels []string
-	failAt   int
-	calls    int
+	replies   []string
+	channels  []string
+	replyTo   []string
+	sentTimes []time.Time
+	errors    []error
+	failAt    int
+	calls     int
+	createdAt time.Time
 }
 
 func (s *senderFake) Reply(_ context.Context, replyTo, channel, content string) (SentMessage, error) {
 	s.calls++
+	s.replyTo = append(s.replyTo, replyTo)
+	if len(s.errors) > 0 {
+		err := s.errors[0]
+		s.errors = s.errors[1:]
+		if err != nil {
+			return SentMessage{}, err
+		}
+	}
 	if s.failAt == s.calls {
 		return SentMessage{}, errors.New("send failed")
 	}
 	s.replies = append(s.replies, content)
 	s.channels = append(s.channels, channel)
-	return SentMessage{ID: "reply-id", CreatedAt: time.Now()}, nil
+	createdAt := time.Now()
+	if !s.createdAt.IsZero() {
+		createdAt = s.createdAt
+	}
+	s.sentTimes = append(s.sentTimes, createdAt)
+	return SentMessage{ID: "reply-id", CreatedAt: createdAt}, nil
 }
+
+type statusRetryError struct {
+	status int
+	delay  time.Duration
+}
+
+func (e statusRetryError) Error() string             { return fmt.Sprintf("HTTP %d", e.status) }
+func (e statusRetryError) StatusCode() int           { return e.status }
+func (e statusRetryError) RetryAfter() time.Duration { return e.delay }
+
+type networkRetryError struct{}
+
+func (networkRetryError) Error() string   { return "temporary network failure" }
+func (networkRetryError) Timeout() bool   { return false }
+func (networkRetryError) Temporary() bool { return true }
+
+var _ net.Error = networkRetryError{}
+
+func TestDiscordRetryHonors429AndUsesBoundedBackoff(t *testing.T) {
+	ctx := context.Background()
+	var waits []time.Duration
+	sender := &senderFake{errors: []error{statusRetryError{status: 429, delay: 1500 * time.Millisecond}}}
+	adapter, err := New(&processorFake{}, testQueue(t), sender, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.sendWithRetry(ctx, "original", "channel", "reply"); err != nil {
+		t.Fatalf("send after 429 retry: %v", err)
+	}
+	if sender.calls != 2 || len(waits) != 1 || waits[0] != 1500*time.Millisecond {
+		t.Fatalf("429 attempts=%d waits=%v; want 2 attempts and exact retry_after", sender.calls, waits)
+	}
+
+	waits = nil
+	sender = &senderFake{errors: []error{networkRetryError{}}}
+	adapter, err = New(&processorFake{}, testQueue(t), sender, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.sendWithRetry(ctx, "original", "channel", "reply"); err != nil {
+		t.Fatalf("send after network retry: %v", err)
+	}
+	if sender.calls != 2 || len(waits) != 1 || waits[0] != time.Second {
+		t.Fatalf("network attempts=%d waits=%v; want one retry after 1s", sender.calls, waits)
+	}
+
+	waits = nil
+	sender = &senderFake{errors: []error{
+		statusRetryError{status: 503},
+		statusRetryError{status: 502},
+		statusRetryError{status: 500},
+	}}
+	adapter, err = New(&processorFake{}, testQueue(t), sender, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.sendWithRetry(ctx, "original", "channel", "reply"); err != nil {
+		t.Fatalf("send after 5xx retries: %v", err)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if sender.calls != 4 || len(waits) != len(want) {
+		t.Fatalf("5xx attempts=%d waits=%v", sender.calls, waits)
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("retry delay[%d]=%s, want %s", i, waits[i], want[i])
+		}
+	}
+}
+
+func TestDiscordRetryDoesNotRetryClientErrorsOr429WithoutRetryAfter(t *testing.T) {
+	for _, failure := range []error{statusRetryError{status: 400}, statusRetryError{status: 401}, statusRetryError{status: 403}, statusRetryError{status: 404}, statusRetryError{status: 429}} {
+		sender := &senderFake{errors: []error{failure}}
+		adapter, err := New(&processorFake{}, testQueue(t), sender, Config{Wait: func(context.Context, time.Duration) error { return nil }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := adapter.sendWithRetry(context.Background(), "original", "channel", "reply"); err == nil {
+			t.Fatalf("send error for %v = nil", failure)
+		}
+		if sender.calls != 1 {
+			t.Fatalf("HTTP %v retried %d times", failure, sender.calls)
+		}
+	}
+}
+
+func TestDiscordRetryStopsAfterConfiguredMaximum(t *testing.T) {
+	waits := make([]time.Duration, 0, 3)
+	sender := &senderFake{errors: []error{
+		statusRetryError{status: 503},
+		statusRetryError{status: 503},
+		statusRetryError{status: 503},
+		statusRetryError{status: 503},
+	}}
+	adapter, err := New(&processorFake{}, testQueue(t), sender, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.sendWithRetry(context.Background(), "original", "channel", "reply"); err == nil {
+		t.Fatal("send succeeded after all attempts failed")
+	}
+	if sender.calls != 4 {
+		t.Fatalf("send attempts=%d, want initial attempt plus 3 retries", sender.calls)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if len(waits) != len(want) {
+		t.Fatalf("waits=%v, want %v", waits, want)
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("retry delay[%d]=%s, want %s", i, waits[i], want[i])
+		}
+	}
+}
+
 func testQueue(t *testing.T) *orchestrator.RequestQueue {
 	t.Helper()
 	q, err := orchestrator.NewRequestQueue(orchestrator.QueueConfig{})
@@ -178,13 +324,17 @@ func TestHandleDoesNotSendErrorReplyAfterCancellation(t *testing.T) {
 
 func TestAdapterNormalizesBotRequestTimesToUTC(t *testing.T) {
 	p := &processorFake{}
-	a, err := New(p, testQueue(t), &senderFake{}, Config{})
+	fixedNow := time.Now().UTC()
+	a, err := New(p, testQueue(t), &senderFake{}, Config{Clock: func() time.Time { return fixedNow }, RequestIDGenerator: func() string { return "request-fixed" }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	createdAt := time.Date(2026, 9, 23, 21, 30, 0, 0, time.FixedZone("discord", 9*60*60))
-	receivedAt := time.Date(2026, 9, 23, 9, 30, 1, 0, time.FixedZone("host", -3*60*60))
-	a.Handle(context.Background(), Incoming{ID: "utc", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: createdAt, ReceivedAt: receivedAt}, "bot")
+	receivedAt := fixedNow
+	a.Handle(context.Background(), Incoming{ID: "utc", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: createdAt}, "bot")
+	if p.request.RequestID != "request-fixed" {
+		t.Fatalf("request_id = %q, want injected ID", p.request.RequestID)
+	}
 	if !p.request.MessageCreatedAt.Equal(createdAt) || p.request.MessageCreatedAt.Location() != time.UTC {
 		t.Fatalf("message_created_at = %v; want same instant in UTC", p.request.MessageCreatedAt)
 	}
@@ -230,7 +380,7 @@ func TestLongReplySavesFirstReplyOnlyAfterAllChunksSucceed(t *testing.T) {
 	s := &senderFake{}
 	a, _ := New(p, testQueue(t), s, Config{})
 	a.Handle(context.Background(), Incoming{ID: "q", ChannelID: "ch", UserID: "u", Content: "ask", IsDM: true, CreatedAt: time.Now()}, "bot")
-	if len(s.replies) != 2 || len(s.replies[0]) > defaultReplyMaxChars || len(s.replies[1]) > defaultReplyMaxChars || len(p.saved) != 1 || p.saved[0].DiscordMessageID != "reply-id" {
+	if len(s.replies) != 2 || len(s.replies[0]) > defaultReplyMaxChars || len(s.replies[1]) > defaultReplyMaxChars || len(s.replyTo) != 2 || s.replyTo[0] != "q" || s.replyTo[1] != "q" || len(s.sentTimes) != 2 || len(p.saved) != 1 || !p.saved[0].Success || p.saved[0].DiscordMessageID != "reply-id" || !p.saved[0].CreatedAt.Equal(s.sentTimes[0]) || len(p.savedContent) != 1 || p.savedContent[0] != p.reply.Content {
 		t.Fatalf("chunks=%d saved=%+v", len(s.replies), p.saved)
 	}
 	p.saved = nil
@@ -244,7 +394,27 @@ func TestLongReplySavesFirstReplyOnlyAfterAllChunksSucceed(t *testing.T) {
 
 func TestSplitMessagePrefersNewlinesAndRuneLimits(t *testing.T) {
 	parts := splitMessage(strings.Repeat("界", 10)+"\n"+strings.Repeat("x", 10), 10)
-	if len(parts) != 2 || len([]rune(parts[0])) > 10 || !strings.Contains(parts[0], "界") {
+	if len(parts) != 3 || len([]rune(parts[0])) > 10 || !strings.Contains(parts[0], "界") || strings.Join(parts, "") != strings.Repeat("界", 10)+"\n"+strings.Repeat("x", 10) {
 		t.Fatalf("parts=%q", parts)
+	}
+}
+
+func TestSplitMessageClosesAndReopensMarkdownCodeFences(t *testing.T) {
+	content := "Result:\n```go\n" + strings.Repeat("fmt.Println(\"hello\")\n", 80) + "```\nDone."
+	parts := splitMessage(content, 100)
+	if len(parts) < 3 {
+		t.Fatalf("split produced %d chunks, want multiple fenced chunks", len(parts))
+	}
+	joined := strings.Join(parts, "\n")
+	if !strings.Contains(joined, "fmt.Println(\"hello\")") || !strings.Contains(joined, "Done.") {
+		t.Fatalf("split lost original content: %q", joined)
+	}
+	for i, part := range parts {
+		if len([]rune(part)) > 100 {
+			t.Errorf("chunk %d has %d runes, over 100", i, len([]rune(part)))
+		}
+		if strings.Count(part, "```")%2 != 0 {
+			t.Errorf("chunk %d leaves a Markdown code fence open: %q", i, part)
+		}
 	}
 }
