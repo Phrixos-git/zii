@@ -5,16 +5,17 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Phrixos-git/zii/internal/chat"
 	"github.com/Phrixos-git/zii/internal/storage"
 )
 
 type fakeTokenCounter struct {
-	lastMessages []Message
+	lastMessages []chat.Message
 	err          error
 }
 
-func (f *fakeTokenCounter) CountTokens(_ context.Context, messages []Message) (int, error) {
-	f.lastMessages = append([]Message(nil), messages...)
+func (f *fakeTokenCounter) CountTokens(_ context.Context, messages []chat.Message) (int, error) {
+	f.lastMessages = append([]chat.Message(nil), messages...)
 	if f.err != nil {
 		return 0, f.err
 	}
@@ -44,7 +45,7 @@ func TestContextBuilderSelectsRecentCompleteTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build context: %v", err)
 	}
-	want := []Message{
+	want := []chat.Message{
 		{Role: "system", Content: "system prompt"},
 		{Role: "user", Content: "nu"},
 		{Role: "assistant", Content: "na"},

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Phrixos-git/zii/internal/chat"
 	"github.com/Phrixos-git/zii/internal/storage"
 )
 
@@ -14,16 +15,10 @@ const (
 	maxHistoryTokenLimit = 8192
 )
 
-// Message is one role-preserving chat message sent to the LLM.
-type Message struct {
-	Role    string
-	Content string
-}
-
 // TokenCounter counts the supplied history messages using the active LLM's
 // tokenizer and chat template.
 type TokenCounter interface {
-	CountTokens(context.Context, []Message) (int, error)
+	CountTokens(context.Context, []chat.Message) (int, error)
 }
 
 // ContextBuilder selects complete historical turns under the design limits.
@@ -52,7 +47,7 @@ func NewContextBuilder(counter TokenCounter, maxTurns, maxHistoryTokens int) (*C
 // current user message as separate role-preserving messages. The token limit
 // applies only to historical messages; it excludes the System Prompt and
 // current user message.
-func (b *ContextBuilder) Build(ctx context.Context, systemPrompt, currentUser string, history []storage.HistoryMessage) ([]Message, error) {
+func (b *ContextBuilder) Build(ctx context.Context, systemPrompt, currentUser string, history []storage.HistoryMessage) ([]chat.Message, error) {
 	if b == nil || b.tokenCounter == nil {
 		return nil, errors.New("orchestrator: context builder is nil")
 	}
@@ -67,10 +62,10 @@ func (b *ContextBuilder) Build(ctx context.Context, systemPrompt, currentUser st
 	}
 
 	turns := completeTurns(history)
-	selected := make([]Message, 0)
+	selected := make([]chat.Message, 0)
 	selectedTurns := 0
 	for i := len(turns) - 1; i >= 0 && selectedTurns < b.maxTurns; i-- {
-		candidate := make([]Message, 0, len(turns[i])+len(selected))
+		candidate := make([]chat.Message, 0, len(turns[i])+len(selected))
 		candidate = append(candidate, turns[i]...)
 		candidate = append(candidate, selected...)
 
@@ -88,18 +83,18 @@ func (b *ContextBuilder) Build(ctx context.Context, systemPrompt, currentUser st
 		selectedTurns++
 	}
 
-	result := make([]Message, 0, len(selected)+2)
-	result = append(result, Message{Role: "system", Content: systemPrompt})
+	result := make([]chat.Message, 0, len(selected)+2)
+	result = append(result, chat.Message{Role: "system", Content: systemPrompt})
 	result = append(result, selected...)
-	result = append(result, Message{Role: "user", Content: currentUser})
+	result = append(result, chat.Message{Role: "user", Content: currentUser})
 	return result, nil
 }
 
-func completeTurns(history []storage.HistoryMessage) [][]Message {
-	turns := make([][]Message, 0)
+func completeTurns(history []storage.HistoryMessage) [][]chat.Message {
+	turns := make([][]chat.Message, 0)
 	for i := 0; i+1 < len(history); {
 		if history[i].Role == "user" && history[i+1].Role == "assistant" {
-			turns = append(turns, []Message{
+			turns = append(turns, []chat.Message{
 				{Role: "user", Content: history[i].Content},
 				{Role: "assistant", Content: history[i+1].Content},
 			})
