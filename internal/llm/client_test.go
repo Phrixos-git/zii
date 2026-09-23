@@ -114,6 +114,7 @@ func TestChatClassifiesFinishReasonsAndInvalidArguments(t *testing.T) {
 		wantErr  error
 	}{
 		{name: "length", response: `{"choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":"length"}]}`, wantErr: ErrTruncated},
+		{name: "invalid response JSON", response: `{"choices":[`, wantErr: ErrResponse},
 		{name: "null finish reason", response: `{"choices":[{"message":{"role":"assistant"},"finish_reason":null}]}`, wantErr: ErrResponse},
 		{name: "unknown finish reason", response: `{"choices":[{"message":{"role":"assistant"},"finish_reason":"unknown"}]}`, wantErr: ErrResponse},
 		{name: "invalid arguments", response: `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"lookup","arguments":"not json"}}]},"finish_reason":"tool_calls"}]}`, wantErr: ErrInvalidArguments},
@@ -131,6 +132,35 @@ func TestChatClassifiesFinishReasonsAndInvalidArguments(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTransportTimesOutWithoutRuntimeDependency(t *testing.T) {
+	transport := &timeoutRoundTripper{}
+	client, err := NewClient(Config{BaseURL: "http://example.test", Model: "test-model", Timeout: time.Second, HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryDelay = 0
+	_, err = client.Chat(context.Background(), []chat.Message{{Role: "user", Content: "q"}}, nil)
+	if err == nil {
+		t.Fatal("Chat succeeded despite HTTP timeout")
+	}
+	if got := transport.calls.Load(); got != 2 {
+		t.Fatalf("HTTP attempts=%d, want one timeout retry", got)
+	}
+}
+
+type timeoutNetworkError struct{}
+
+func (timeoutNetworkError) Error() string   { return "request timed out" }
+func (timeoutNetworkError) Timeout() bool   { return true }
+func (timeoutNetworkError) Temporary() bool { return true }
+
+type timeoutRoundTripper struct{ calls atomic.Int32 }
+
+func (rt *timeoutRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	rt.calls.Add(1)
+	return nil, timeoutNetworkError{}
 }
 
 func TestCountTokensUsesLlamaCPPInputTokensEndpoint(t *testing.T) {

@@ -24,10 +24,7 @@ const (
 	maxFetchPageCalls      = 3
 )
 
-type ChatClient interface {
-	Chat(context.Context, []chat.Message, []llm.ToolDefinition) (llm.Completion, error)
-	CountTokens(context.Context, []chat.Message) (int, error)
-}
+type ChatClient = llm.ChatClient
 
 type SearchToolClient interface {
 	Call(context.Context, string, json.RawMessage) (searchmcp.ToolResult, error)

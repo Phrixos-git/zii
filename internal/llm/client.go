@@ -16,6 +16,12 @@ var (
 	ErrInvalidArguments = errors.New("llm: invalid tool call arguments")
 )
 
+// ChatClient is the LLM boundary used by orchestration and tests.
+type ChatClient interface {
+	Chat(context.Context, []chat.Message, []ToolDefinition) (Completion, error)
+	CountTokens(context.Context, []chat.Message) (int, error)
+}
+
 // ToolDefinition describes one function offered to the OpenAI-compatible
 // Chat Completions endpoint. Parameters must contain a JSON Schema object.
 type ToolDefinition struct {
