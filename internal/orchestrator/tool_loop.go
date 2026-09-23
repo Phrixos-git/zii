@@ -171,43 +171,49 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		if strings.TrimSpace(call.ID) == "" || call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
 			return "", errors.New("orchestrator: malformed LLM tool call")
 		}
-		arguments, argsErr := call.Function.NormalizedArguments()
-		completion.Message.ToolCalls[0].Function.Arguments = arguments
 		messages = append(messages, completion.Message)
 		toolContent := []byte{}
 		callName := call.Function.Name
 		totalCalls++
-		callCounts[callName]++
 
-		switch {
-		case toolsDisabled || totalCalls > l.maxToolCalls:
-			toolsDisabled = true
-			toolContent = safeToolError("tool_limit_reached", false, "")
-		case argsErr != nil:
-			toolContent = safeToolError("invalid_argument", false, "")
-		case !l.registry.IsAllowed(callName):
+		// Validate in the same order as the runtime contract. In particular,
+		// do not parse or expose arguments for a tool outside the allowlist.
+		if !l.registry.IsAllowed(callName) {
 			toolContent = safeToolError("not_found", false, "")
-		case callCounts[callName] > l.callLimits[callName]:
-			toolContent = safeToolError("rate_limited", false, "")
-		default:
+		} else if arguments, argsErr := call.Function.NormalizedArguments(); argsErr != nil {
+			toolContent = safeToolError("invalid_argument", false, "")
+		} else {
+			completion.Message.ToolCalls[0].Function.Arguments = arguments
+			messages[len(messages)-1] = completion.Message
 			if err := l.registry.Validate(callName, arguments); err != nil {
 				toolContent = safeToolError("invalid_argument", false, "")
-			} else if signature, err := normalizedCallSignature(callName, arguments); err != nil {
-				toolContent = safeToolError("invalid_argument", false, "")
-			} else if _, duplicate := seenCalls[signature]; duplicate {
-				toolContent = safeToolError("duplicate_call", false, "")
 			} else {
-				seenCalls[signature] = struct{}{}
-				result, invokeErr := l.invoke(ctx, callName, arguments)
-				if invokeErr != nil {
-					if ctx.Err() != nil {
-						return "", ctx.Err()
+				callCounts[callName]++
+				switch {
+				case toolsDisabled || totalCalls > l.maxToolCalls:
+					toolsDisabled = true
+					toolContent = safeToolError("tool_limit_reached", false, "")
+				case callCounts[callName] > l.callLimits[callName]:
+					toolContent = safeToolError("rate_limited", false, "")
+				default:
+					if signature, err := normalizedCallSignature(callName, arguments); err != nil {
+						toolContent = safeToolError("invalid_argument", false, "")
+					} else if _, duplicate := seenCalls[signature]; duplicate {
+						toolContent = safeToolError("duplicate_call", false, "")
+					} else {
+						seenCalls[signature] = struct{}{}
+						result, invokeErr := l.invoke(ctx, callName, arguments)
+						if invokeErr != nil {
+							if ctx.Err() != nil {
+								return "", ctx.Err()
+							}
+							toolContent = safeToolError("tool_unavailable", true, "")
+						} else if result.IsError {
+							toolContent = sanitizeMCPError(result.Data)
+						} else {
+							toolContent = result.Data
+						}
 					}
-					toolContent = safeToolError("tool_unavailable", true, "")
-				} else if result.IsError {
-					toolContent = sanitizeMCPError(result.Data)
-				} else {
-					toolContent = result.Data
 				}
 			}
 		}

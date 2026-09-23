@@ -160,6 +160,54 @@ func TestToolLoopRejectsInvalidSchemaBeforeMCPAndAllowsSelfCorrection(t *testing
 	}
 }
 
+func TestToolLoopChecksAllowlistBeforeParsingArguments(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{responses: []llm.Completion{
+		fakeToolCall("unknown", "admin_delete", `{not-json`),
+		{FinishReason: "stop", Message: chat.Message{Role: "assistant", Content: "done"}},
+	}}
+	search := &fakeLoopSearch{}
+	loop, _ := NewToolLoop(fakeLLM, search, newTestRegistry(t))
+	loop.mcpRetryDelay = 0
+	if _, err := loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "q"}}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(search.calls) != 0 {
+		t.Fatalf("unallowlisted tool reached MCP: %v", search.calls)
+	}
+	var toolError map[string]string
+	if err := json.Unmarshal([]byte(fakeLLM.requests[1][2].Content), &toolError); err != nil {
+		t.Fatalf("decode tool error: %v", err)
+	}
+	if toolError["code"] != "not_found" {
+		t.Fatalf("tool error = %v, want not_found before argument parsing", toolError)
+	}
+}
+
+func TestToolLoopChecksSchemaBeforePerToolLimit(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{responses: []llm.Completion{
+		fakeToolCall("one", "search_local", `{"query":"first"}`),
+		fakeToolCall("two", "search_local", `{"query":"second"}`),
+		fakeToolCall("invalid", "search_local", `{"query":2}`),
+		fakeToolCall("limited", "search_local", `{"query":"fourth"}`),
+		{FinishReason: "stop", Message: chat.Message{Role: "assistant", Content: "done"}},
+	}}
+	search := &fakeLoopSearch{}
+	loop, _ := NewToolLoop(fakeLLM, search, newTestRegistry(t))
+	loop.mcpRetryDelay = 0
+	if _, err := loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "q"}}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(search.calls) != maxSearchLocalCalls {
+		t.Fatalf("Search MCP calls = %v; want %d", search.calls, maxSearchLocalCalls)
+	}
+	if !strings.Contains(fakeLLM.requests[3][6].Content, "invalid_argument") {
+		t.Fatalf("schema error = %q; want schema validation before call limit", fakeLLM.requests[3][6].Content)
+	}
+	if !strings.Contains(fakeLLM.requests[4][8].Content, "rate_limited") {
+		t.Fatalf("limit error = %q", fakeLLM.requests[4][8].Content)
+	}
+}
+
 func TestToolLoopDetectsDuplicateCalls(t *testing.T) {
 	responses := make([]llm.Completion, 0, 3)
 	responses = append(responses,
