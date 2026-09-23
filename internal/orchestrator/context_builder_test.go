@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/Phrixos-git/zii/internal/chat"
@@ -55,7 +56,7 @@ func TestContextBuilderSelectsRecentCompleteTurns(t *testing.T) {
 		t.Fatalf("context length = %d, want %d: %+v", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Fatalf("context[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
