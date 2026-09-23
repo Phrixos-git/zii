@@ -74,11 +74,11 @@ INDEX
 - 状態：決定
 - 決めたいこと：
     - `guild_id + scope_id + user_id`
-    - `last_active_at`  
+    - `last_active_at`
         を使った既存Conversation検索条件
 - 決定事項
     - `guild_id + scope_id + user_id`
-    - `last_active_at`  
+    - `last_active_at`
         ・`guild_id + scope_id + user_id`が存在するかつ
 	        last_active_at > now - 7日場合にActive Conversationと判断
 	- 複数候補がある場合は以下で取得
@@ -95,7 +95,7 @@ INDEX
     - Conversation検索用Index
 	    - (guild_id, scope_id, user_id, last_active_at)
     - UNIQUE制約が必要か
-	    - id：PRIMARY KEYとして一意 
+	    - id：PRIMARY KEYとして一意
 	    - Conversation Key：UNIQUEにしない
 
 ## リスク

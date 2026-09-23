@@ -11,9 +11,9 @@ tags: []
 
 ## 相談目的
 
-Discord Botから受け取った質問をOrchestratorが処理し、  
-Conversation履歴を管理しながらLocal LLMへ問い合わせ、  
-必要に応じてSearch MCPを呼び出し、  
+Discord Botから受け取った質問をOrchestratorが処理し、
+Conversation履歴を管理しながらLocal LLMへ問い合わせ、
+必要に応じてSearch MCPを呼び出し、
 最終回答をDiscord Botへ返すための設計を行う。
 
 ## 背景
@@ -96,18 +96,18 @@ user_id = 質問者
 ### Conversation ID
 
 - `conversation_key`と`conversation_id`は分離する
-    
+
 - `conversation_id`はUUID
-    
+
 - 同じ`conversation_key`でもConversation期限切れ後は新しい`conversation_id`を作成する
-    
+
 
 ### Conversation有効期間
 
 - 最終User Messageから7日
-    
+
 - 判定：
-    
+
 
 ```
 now >= last_active_at + 7日
@@ -120,19 +120,19 @@ now < last_active_at + 7日
 ### Conversation履歴
 
 - Conversation期間中のMessage履歴はSQLiteへ全件保存する
-    
+
 - LLM Contextへ渡す履歴は最大5ターン
-    
+
 - Conversation履歴Context上限は8,192 tokens
-    
+
 - 1ターンは`user + assistant`の1往復
-    
+
 - Token上限を超える場合は古いターンから除外する
-    
+
 - ターン途中では分割しない
-    
+
 - Token数はSQLiteへ保存せずContext Builderで計算する
-    
+
 
 ### Discord Reply
 
@@ -189,7 +189,7 @@ INDEX
 ## OR-01：リクエスト処理フロー
 
 - 状態：**決定**
-    
+
 - 決めたいこと：
     - Discord Message受信から最終Replyまでの処理順
     - Conversation取得・更新のタイミング
@@ -199,7 +199,7 @@ INDEX
 - 前提・制約：
     - User MessageはSQLiteへ保存する
     - Bot最終回答もSQLiteへ保存する
-    - Tool Resultはmessagesテーブルへ保存しない   
+    - Tool Resultはmessagesテーブルへ保存しない
 - 決定内容：
 	- Discord Message受信
 		- BotがUser Messageを受信したら以下をOrchestratorへ渡す
@@ -225,7 +225,7 @@ INDEX
 					scope_id
 					user_id
 					last_active_at > now - 7日
-					
+
 					存在する
 				    → 既存conversation_idを使用
 					存在しない / 7日経過
@@ -259,7 +259,7 @@ INDEX
 						Orchestrator
 					    ↓
 						llama.cpp
-						
+
 						Orchestrator自身が先回りしてSearch MCPを呼ぶのではなく、
 						LLMがTool Callを要求した時点で呼び出す形
 					```
@@ -336,7 +336,7 @@ INDEX
 				LLM
 		        ↓
 				┌───────────────┬────────────────┐
-				│ 最終回答       │ Tool Call      
+				│ 最終回答       │ Tool Call
 				│               │        ↓
 				│               │ Arguments検証
 				│               │        ↓
@@ -360,13 +360,13 @@ INDEX
 				```
 
 - 決定理由：
-    
+
 - 影響する項目：
-    
+
 - 残課題：
-    
+
 - 確認方法：
-    
+
 
 ---
 
@@ -544,7 +544,7 @@ null / unknown
     - 通常回答
     - Tool Call
     - `length`
-    - 不正Arguments  
+    - 不正Arguments
         の4ケースをテストする。
 
 ---
@@ -870,7 +870,7 @@ User Request全体:
 - LLM Retry：
     - Connection Error
     - Connection Reset
-    - HTTP 5xx  
+    - HTTP 5xx
         に限り**1回**
     - Retry interval：2秒
 - LLMが正常Responseを返した後の内容不良はNetwork Retryしない。
@@ -930,7 +930,7 @@ network_error
 - Search MCPの`internal_error`は：
     - `code`
     - `retryable`
-    - `error_id`  
+    - `error_id`
         のみLLMへ渡す。
     - stack trace等は渡さない。
 - MCP Protocol / Transport ErrorはOrchestratorが処理し、Retry失敗後は`tool_unavailable`相当へ正規化。
@@ -1016,7 +1016,7 @@ created_at =
     - 正常Reply
     - Discord送信失敗
     - `length`
-    - 空Content  
+    - 空Content
         を試験。
 
 ---
@@ -1073,7 +1073,7 @@ COMMIT
 - 確認方法：
     - Duplicate Discord Event
     - SQLite BUSY
-    - Discord成功後DB失敗  
+    - Discord成功後DB失敗
         を試験。
 
 ---
@@ -1245,7 +1245,7 @@ Process終了
     - LLM実行中
     - MCP実行中
     - SQLite Transaction中
-    - Queue待機中  
+    - Queue待機中
         それぞれでSIGTERMを送り、DB破損や重複Replyが発生しないこと。
 ## OR-18：Prompt Injection対策
 

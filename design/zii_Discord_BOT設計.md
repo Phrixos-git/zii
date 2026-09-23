@@ -79,7 +79,7 @@ DIRECT_MESSAGES
 - DMでは通常Messageを受付する。
 - DiscordではDMおよびBotが@mentionされたMessageは、Message Content Intentなしでも内容へアクセスできる。
 - `GUILD_MEMBERS`
-- `GUILD_PRESENCES`  
+- `GUILD_PRESENCES`
     は有効化しない。
 - 決定理由：
     - 必要最小限のDiscordデータだけ取得できる。
@@ -225,7 +225,7 @@ BotRequest
     - 質問者
 - `content`
     - mention除去・trim済み本文
-- message_created_at Discord 
+- message_created_at Discord
 	- Message自体の作成時刻 → messages.created_atへ保存
 	- messages.created_at = message_created_at
 - `received_at`
@@ -357,7 +357,7 @@ Bot Reply
 - 確認方法：
     - 1,900文字以下
     - 4,000文字程度
-    - Markdown code blockあり  
+    - Markdown code blockあり
         を試験。
 
 ---
@@ -411,7 +411,7 @@ HTTP 5xx
 - Network / 5xx：
     - 1秒
     - 2秒
-    - 4秒  
+    - 4秒
         の指数Backoff
 - 以下はRetryしない：
 
@@ -452,7 +452,7 @@ HTTP 5xx
     - 採用Discord Library確定後にAPIを確認。
 - 確認方法：
     - Network切断→復旧
-    - Discord Gateway再接続  
+    - Discord Gateway再接続
         を試験。
 
 ---

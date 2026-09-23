@@ -4,7 +4,13 @@ Zii is a Go Discord bot that stores per-user conversation history in SQLite, ask
 
 ## Run
 
-Use Go 1.25 or newer. Create a private runtime environment file from `.env.example`, set `DISCORD_BOT_TOKEN`, `LLM_MODEL`, and an absolute `BOT_DB_PATH`, then export its values before starting Zii:
+Before starting Zii, have these services ready:
+
+- A Discord bot application and token. Enable the `Guilds`, `Guild Messages`, and `Direct Messages` Gateway intents. Do not enable the privileged Message Content intent. Invite the bot with View Channels, Send Messages, Send Messages in Threads, and Read Message History permissions.
+- An OpenAI-compatible LLM server with the selected model loaded. By default, Zii connects to `http://127.0.0.1:8080`.
+- Search MCP serving its Streamable HTTP endpoint. By default, Zii connects to `http://127.0.0.1:8081/mcp`. Zii connects to Search MCP during startup and exits if it is unavailable.
+
+Use Go 1.25 or newer. From the repository root, create a private runtime environment file from `.env.example`. Set `DISCORD_BOT_TOKEN`, `LLM_MODEL` to the model identifier accepted by your LLM server, and `BOT_DB_PATH` to an absolute path where Zii can create its SQLite database. Adjust the endpoint URLs in `.env` if your services use different addresses. The `.env` file is not loaded automatically; export its values and start Zii with:
 
 ```sh
 cp .env.example .env
@@ -15,9 +21,7 @@ set +a
 go run ./cmd/zii
 ```
 
-The LLM and Search MCP URLs are runtime settings. The defaults are `http://127.0.0.1:8080` and `http://127.0.0.1:8081/mcp`; Zii connects to them only when the application runs. Zii requires Search MCP to be available at startup and loads its allowlisted tool schemas before opening the Discord Gateway.
-
-In Discord, enable the `Guilds`, `Guild Messages`, and `Direct Messages` Gateway intents. Do not enable the privileged Message Content intent. Invite Zii with View Channels, Send Messages, Send Messages in Threads, and Read Message History permissions. In servers, Zii handles messages that mention the bot; in DMs, it handles ordinary text messages.
+Zii loads its Search MCP tool schemas before opening the Discord Gateway. In servers, it handles messages that mention the bot; in DMs, it handles ordinary text messages. Press Ctrl+C to stop Zii; it stops accepting requests and shuts down gracefully.
 
 ## Verify
 

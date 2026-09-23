@@ -60,18 +60,18 @@ INDEX
     - Conversation削除時の扱い
 - 決定事項
 	- conversation_id
-		- NOT NULL 
+		- NOT NULL
 		- conversations.idと同じ型
-	- Foreign Key 
+	- Foreign Key
 		- messages.conversation_id → conversations.id
-	- ON DELETE 
-		- CASCADE 
-	- SQLite 
-		- foreign_keys = ON 
-	- Conversation期限切れ 
-		- 削除しない 
-		- 新しいconversation_idを作成する 
-	- 実際にConversationをDELETEした場合のみ 
+	- ON DELETE
+		- CASCADE
+	- SQLite
+		- foreign_keys = ON
+	- Conversation期限切れ
+		- 削除しない
+		- 新しいconversation_idを作成する
+	- 実際にConversationをDELETEした場合のみ
 		- 所属Messageも自動削除
 ### MSG-03：Discord Message ID
 
@@ -85,9 +85,9 @@ INDEX
 	- `discord_message_id`の型：TEXT
 	- `NULL`を許可するか：不可
 	- `UNIQUE`制約を付けるか：付ける
-	- Discordから取得したMessage IDを文字列のまま保存する 
-	- messages.idとは分離する 
-	- User Message / Bot Replyの両方を保存する 
+	- Discordから取得したMessage IDを文字列のまま保存する
+	- messages.idとは分離する
+	- User Message / Bot Replyの両方を保存する
 		- Assistant Messageの場合
 		  - 通常Reply：
 		    - 実際のDiscord Reply Message IDを保存する。
@@ -102,7 +102,7 @@ INDEX
 - 決めたいこと：
     - `user`
     - `assistant`
-    - 必要なら`tool`  
+    - 必要なら`tool`
         のどこまで保存するか
 - 決定事項
 	- Column:
@@ -147,23 +147,23 @@ INDEX
     - `token_count`を保存するか
     - 8,192 tokens制御に利用するか
 - 決定事項
-	- token_count: 
-		- SQLiteには保存しない 
-		- Token計算: 
-			- OrchestratorのContext Builderで実行 
-			- 使用中LLMと互換性のあるTokenizerを使用 
-		- Conversation履歴上限: 
-			- 最大5ターン 
-			- 最大8,192 tokens 
-			- どちらか先に到達した方を上限とする 
-		- 履歴選択: 
-			- 最新ターンから遡って追加する 
-			- 8,192 tokensを超える古いターンを除外する 
-		- ターンの扱い: 
-			- user + assistantを1単位とする 
-			- ターン途中で分割しない 
-		- 8,192 tokensの対象: 
-			- 過去Conversation履歴のみ 
+	- token_count:
+		- SQLiteには保存しない
+		- Token計算:
+			- OrchestratorのContext Builderで実行
+			- 使用中LLMと互換性のあるTokenizerを使用
+		- Conversation履歴上限:
+			- 最大5ターン
+			- 最大8,192 tokens
+			- どちらか先に到達した方を上限とする
+		- 履歴選択:
+			- 最新ターンから遡って追加する
+			- 8,192 tokensを超える古いターンを除外する
+		- ターンの扱い:
+			- user + assistantを1単位とする
+			- ターン途中で分割しない
+		- 8,192 tokensの対象:
+			- 過去Conversation履歴のみ
 			- System Prompt / 今回のUser Message / Tool Result / 最終回答枠は含めない
 ### MSG-07：Timestamp
 
@@ -180,7 +180,7 @@ INDEX
 
 - 状態：決定
 - 決めたいこと：
-    - `conversation_id + created_at`  
+    - `conversation_id + created_at`
         の複合Index
 - 決定事項
 	- 採用する
