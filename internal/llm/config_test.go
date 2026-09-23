@@ -23,6 +23,9 @@ func TestNewClientDefaultsAndURLNormalization(t *testing.T) {
 	if client.retryDelay != 2*time.Second {
 		t.Fatalf("retry delay = %s, want 2s", client.retryDelay)
 	}
+	if client.maxTokens != 4096 {
+		t.Fatalf("max tokens = %d, want 4096", client.maxTokens)
+	}
 }
 
 func TestNewClientUsesInjectedHTTPClient(t *testing.T) {
@@ -35,8 +38,69 @@ func TestNewClientUsesInjectedHTTPClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	if client.httpClient != httpClient {
-		t.Fatal("NewClient did not preserve injected HTTP client")
+	if client.httpClient == httpClient || client.httpClient.Timeout != httpClient.Timeout {
+		t.Fatal("NewClient did not safely copy the injected HTTP client settings")
+	}
+	if client.httpClient.Transport != httpClient.Transport {
+		t.Fatal("NewClient did not preserve injected HTTP transport")
+	}
+	if httpClient.Timeout != 7*time.Second {
+		t.Fatalf("NewClient mutated injected client timeout: %s", httpClient.Timeout)
+	}
+
+	noTimeout := &http.Client{}
+	client, err = NewClient(Config{BaseURL: "https://example.test", Model: "model", Timeout: 4 * time.Second, HTTPClient: noTimeout})
+	if err != nil {
+		t.Fatalf("NewClient with zero-timeout injection: %v", err)
+	}
+	if client.httpClient.Timeout != 4*time.Second || noTimeout.Timeout != 0 {
+		t.Fatalf("effective timeout = %s, original timeout = %s", client.httpClient.Timeout, noTimeout.Timeout)
+	}
+}
+
+func TestNewClientFromEnvUsesRuntimeDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("LLM_BASE_URL", "")
+	t.Setenv("LLM_MODEL", "model-alias")
+	t.Setenv("LLM_TIMEOUT", "")
+	t.Setenv("LLM_MAX_TOKENS", "")
+	client, err := NewClientFromEnv()
+	if err != nil {
+		t.Fatalf("NewClientFromEnv defaults: %v", err)
+	}
+	if client.baseURL != defaultBaseURL || client.model != "model-alias" || client.httpClient.Timeout != 180*time.Second || client.maxTokens != 4096 {
+		t.Fatalf("default env configuration = %+v", client)
+	}
+
+	t.Setenv("LLM_BASE_URL", "https://llm.example.test/api/")
+	t.Setenv("LLM_MODEL", "other-alias")
+	t.Setenv("LLM_TIMEOUT", "45s")
+	t.Setenv("LLM_MAX_TOKENS", "2048")
+	client, err = NewClientFromEnv()
+	if err != nil {
+		t.Fatalf("NewClientFromEnv overrides: %v", err)
+	}
+	if client.baseURL != "https://llm.example.test/api" || client.model != "other-alias" || client.httpClient.Timeout != 45*time.Second || client.maxTokens != 2048 {
+		t.Fatalf("override env configuration = %+v", client)
+	}
+}
+
+func TestNewClientFromEnvRejectsMissingModelAndInvalidLimits(t *testing.T) {
+	t.Setenv("LLM_BASE_URL", "http://127.0.0.1:8080")
+	t.Setenv("LLM_MODEL", "")
+	t.Setenv("LLM_TIMEOUT", "")
+	t.Setenv("LLM_MAX_TOKENS", "")
+	if _, err := NewClientFromEnv(); err == nil {
+		t.Fatal("NewClientFromEnv accepted a missing model")
+	}
+
+	t.Setenv("LLM_MODEL", "model")
+	for name, value := range map[string]string{"LLM_TIMEOUT": "0s", "LLM_MAX_TOKENS": "-1"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, value)
+			if _, err := NewClientFromEnv(); err == nil {
+				t.Fatalf("NewClientFromEnv accepted %s=%q", name, value)
+			}
+		})
 	}
 }
 
