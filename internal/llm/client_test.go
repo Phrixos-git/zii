@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -134,7 +135,7 @@ func TestChatClassifiesFinishReasonsAndInvalidArguments(t *testing.T) {
 	}
 }
 
-func TestTransportTimesOutWithoutRuntimeDependency(t *testing.T) {
+func TestTransportDoesNotRetryTimeout(t *testing.T) {
 	transport := &timeoutRoundTripper{}
 	client, err := NewClient(Config{BaseURL: "http://example.test", Model: "test-model", Timeout: time.Second, HTTPClient: &http.Client{Transport: transport}})
 	if err != nil {
@@ -145,8 +146,8 @@ func TestTransportTimesOutWithoutRuntimeDependency(t *testing.T) {
 	if err == nil {
 		t.Fatal("Chat succeeded despite HTTP timeout")
 	}
-	if got := transport.calls.Load(); got != 2 {
-		t.Fatalf("HTTP attempts=%d, want one timeout retry", got)
+	if got := transport.calls.Load(); got != 1 {
+		t.Fatalf("HTTP attempts=%d, want timeout to be attempted once", got)
 	}
 }
 
@@ -236,19 +237,13 @@ func TestTransportRetriesOnlyServerErrors(t *testing.T) {
 	}
 }
 
-type temporaryNetworkError struct{}
-
-func (temporaryNetworkError) Error() string   { return "temporary network failure" }
-func (temporaryNetworkError) Timeout() bool   { return false }
-func (temporaryNetworkError) Temporary() bool { return true }
-
 type retryRoundTripper struct {
 	calls atomic.Int32
 }
 
 func (rt *retryRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	if rt.calls.Add(1) == 1 {
-		return nil, temporaryNetworkError{}
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNRESET}
 	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -283,5 +278,3 @@ func TestWaitRetryRespectsCancellation(t *testing.T) {
 		t.Fatalf("waitRetry error = %v, want context.Canceled", err)
 	}
 }
-
-var _ net.Error = temporaryNetworkError{}

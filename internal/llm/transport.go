@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -32,7 +33,7 @@ func (c *Client) postJSON(ctx context.Context, path string, payload []byte) ([]b
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			if attempt == 0 && ctx.Err() == nil && isNetworkError(err) {
+			if attempt == 0 && ctx.Err() == nil && isRetryableConnectionError(err) {
 				if waitErr := waitRetry(ctx, c.retryDelay); waitErr != nil {
 					return nil, waitErr
 				}
@@ -44,7 +45,7 @@ func (c *Client) postJSON(ctx context.Context, path string, payload []byte) ([]b
 		body, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if readErr != nil {
-			if attempt == 0 && ctx.Err() == nil && isNetworkError(readErr) {
+			if attempt == 0 && ctx.Err() == nil && isRetryableConnectionError(readErr) {
 				if waitErr := waitRetry(ctx, c.retryDelay); waitErr != nil {
 					return nil, waitErr
 				}
@@ -69,9 +70,21 @@ func (c *Client) postJSON(ctx context.Context, path string, payload []byte) ([]b
 	return nil, errors.New("llm: request failed after retry")
 }
 
-func isNetworkError(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr)
+func isRetryableConnectionError(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return !opErr.Timeout()
+	}
+	return errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 func waitRetry(ctx context.Context, delay time.Duration) error {

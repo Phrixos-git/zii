@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -93,5 +94,63 @@ func TestRequestQueueReturnsBusyAtCapacity(t *testing.T) {
 	close(release)
 	if err := <-queued; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRequestQueueWaitTimeoutDoesNotStartExpiredWork(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 2, MaxRunning: 1, QueueWait: 30 * time.Millisecond, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Shutdown(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		first <- q.Submit(context.Background(), "active", func(context.Context) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	secondStarted := make(chan struct{}, 1)
+	err = q.Submit(context.Background(), "queued", func(context.Context) error {
+		secondStarted <- struct{}{}
+		return nil
+	})
+	if !errors.Is(err, ErrQueueWaitTimeout) {
+		t.Fatalf("queued Submit error = %v, want ErrQueueWaitTimeout", err)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("expired queued work was started")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestRequestQueueCancelsWorkAtRequestDeadline(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 1, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: 30 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Shutdown(context.Background())
+	workCanceled := make(chan struct{})
+	err = q.Submit(context.Background(), "deadline", func(ctx context.Context) error {
+		<-ctx.Done()
+		close(workCanceled)
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Submit error = %v, want request deadline", err)
+	}
+	select {
+	case <-workCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("request deadline did not cancel work")
 	}
 }
