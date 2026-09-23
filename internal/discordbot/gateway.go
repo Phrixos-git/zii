@@ -18,7 +18,18 @@ type Gateway struct {
 	cancel  context.CancelFunc
 }
 
-func NewGateway(token string) (*Gateway, error) {
+// GatewayClient is the Discord lifecycle boundary used by the application.
+// Tests can provide a fake implementation without opening a Discord session.
+type GatewayClient interface {
+	Bind(*Adapter) error
+	Open() error
+	Close() error
+	Sender() ReplySender
+}
+
+var _ GatewayClient = (*Gateway)(nil)
+
+func NewGateway(token string) (GatewayClient, error) {
 	if token == "" {
 		return nil, errors.New("discordbot: token is required")
 	}
@@ -42,7 +53,7 @@ func (g *Gateway) Bind(adapter *Adapter) error {
 			return
 		}
 		m := event.Message
-		incoming := Incoming{ID: m.ID, GuildID: m.GuildID, ChannelID: m.ChannelID, UserID: "", Content: m.Content, CreatedAt: m.Timestamp, ReceivedAt: time.Now().UTC(), Webhook: m.WebhookID != "", System: m.Type != discordgo.MessageTypeDefault && m.Type != discordgo.MessageTypeReply, IsDM: m.GuildID == ""}
+		incoming := Incoming{ID: m.ID, GuildID: m.GuildID, ChannelID: m.ChannelID, UserID: "", Content: m.Content, CreatedAt: m.Timestamp.UTC(), ReceivedAt: time.Now().UTC(), Webhook: m.WebhookID != "", System: m.Type != discordgo.MessageTypeDefault && m.Type != discordgo.MessageTypeReply, IsDM: m.GuildID == ""}
 		if m.Author != nil {
 			incoming.UserID = m.Author.ID
 			incoming.AuthorBot = m.Author.Bot
@@ -88,7 +99,7 @@ func (s discordSender) Reply(_ context.Context, replyTo, channelID, content stri
 		}
 		return SentMessage{}, err
 	}
-	return SentMessage{ID: sent.ID, CreatedAt: sent.Timestamp}, nil
+	return SentMessage{ID: sent.ID, CreatedAt: sent.Timestamp.UTC()}, nil
 }
 
 func boolPointer(value bool) *bool { return &value }

@@ -149,6 +149,14 @@ func TestHandleDMAndRejectsBotsWebhookAndInvalidInput(t *testing.T) {
 	m.Webhook = true
 	a.Handle(context.Background(), m, "bot")
 	m.Webhook = false
+	m.ID = "system"
+	m.System = true
+	a.Handle(context.Background(), m, "bot")
+	m.System = false
+	m.ID = "empty"
+	m.Content = ""
+	a.Handle(context.Background(), m, "bot")
+	m.ID = "long"
 	m.Content = strings.Repeat("x", maxInputChars+1)
 	a.Handle(context.Background(), m, "bot")
 	if len(s.replies) != count {
@@ -165,6 +173,55 @@ func TestHandleDoesNotSendErrorReplyAfterCancellation(t *testing.T) {
 	a.Handle(ctx, Incoming{ID: "m", ChannelID: "c", UserID: "u", Content: "q", IsDM: true, CreatedAt: time.Now()}, "bot")
 	if len(s.replies) != 0 {
 		t.Fatalf("replies after cancellation = %v", s.replies)
+	}
+}
+
+func TestAdapterNormalizesBotRequestTimesToUTC(t *testing.T) {
+	p := &processorFake{}
+	a, err := New(p, testQueue(t), &senderFake{}, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 9, 23, 21, 30, 0, 0, time.FixedZone("discord", 9*60*60))
+	receivedAt := time.Date(2026, 9, 23, 9, 30, 1, 0, time.FixedZone("host", -3*60*60))
+	a.Handle(context.Background(), Incoming{ID: "utc", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: createdAt, ReceivedAt: receivedAt}, "bot")
+	if !p.request.MessageCreatedAt.Equal(createdAt) || p.request.MessageCreatedAt.Location() != time.UTC {
+		t.Fatalf("message_created_at = %v; want same instant in UTC", p.request.MessageCreatedAt)
+	}
+	if !p.request.ReceivedAt.Equal(receivedAt) || p.request.ReceivedAt.Location() != time.UTC {
+		t.Fatalf("received_at = %v; want same instant in UTC", p.request.ReceivedAt)
+	}
+}
+
+func TestAdapterEnforcesUserBurstRateLimit(t *testing.T) {
+	p := &processorFake{}
+	s := &senderFake{}
+	a, err := New(p, testQueue(t), s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		a.Handle(context.Background(), Incoming{ID: string(rune('1' + i)), ChannelID: "dm", UserID: "same-user", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	}
+	if len(s.replies) != 2 || len(p.saved) != 2 {
+		t.Fatalf("burst accepted %d messages and sent %d replies; want 2 each", len(p.saved), len(s.replies))
+	}
+}
+
+func TestNormalizeInputRejectsInvalidUTF8AndExcessiveInvisibleFormatRunes(t *testing.T) {
+	if _, ok := normalizeInput(string([]byte{0xff, 0xfe})); ok {
+		t.Fatal("invalid UTF-8 input was accepted")
+	}
+	ordinary, ok := normalizeInput("keep\u200bzero-width")
+	if !ok || ordinary != "keep\u200bzero-width" {
+		t.Fatalf("ordinary zero-width input was removed or rejected: %q, %v", ordinary, ok)
+	}
+	if _, ok := normalizeInput(strings.Repeat("\u2060", 65)); ok {
+		t.Fatal("excessive invisible format runes were accepted")
+	}
+	cleaned, ok := normalizeInput("before\x00after\n\tline")
+	if !ok || cleaned != "beforeafter\n\tline" {
+		t.Fatalf("control character handling = %q, %v", cleaned, ok)
 	}
 }
 

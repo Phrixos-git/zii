@@ -141,7 +141,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 	a.active.Add(1)
 	a.mu.Unlock()
 	defer func() { a.mu.Lock(); delete(a.inFlight, msg.ID); a.mu.Unlock(); a.active.Done() }()
-	request := orchestrator.Request{RequestID: uuid.NewString(), DiscordMessageID: msg.ID, GuildID: nullable(msg.GuildID), ChannelID: msg.ChannelID, ThreadID: msg.ThreadID, UserID: msg.UserID, Content: msg.Content, MessageCreatedAt: msg.CreatedAt, ReceivedAt: msg.ReceivedAt}
+	request := orchestrator.Request{RequestID: uuid.NewString(), DiscordMessageID: msg.ID, GuildID: nullable(msg.GuildID), ChannelID: msg.ChannelID, ThreadID: msg.ThreadID, UserID: msg.UserID, Content: msg.Content, MessageCreatedAt: msg.CreatedAt.UTC(), ReceivedAt: msg.ReceivedAt.UTC()}
 	replyChannelID := msg.ChannelID
 	if msg.ThreadID != "" {
 		replyChannelID = msg.ThreadID
@@ -311,7 +311,7 @@ func normalizeInput(content string) (string, bool) {
 	}
 	zeroWidth := 0
 	for _, r := range content {
-		if r == 0x200b || r == 0x200c || r == 0x200d || r == 0xfeff {
+		if isZeroWidthOrFormat(r) {
 			zeroWidth++
 		}
 	}
@@ -319,6 +319,13 @@ func normalizeInput(content string) (string, bool) {
 		return "", false
 	}
 	return content, true
+}
+
+func isZeroWidthOrFormat(r rune) bool {
+	return (r >= 0x200b && r <= 0x200f) ||
+		(r >= 0x202a && r <= 0x202e) ||
+		(r >= 0x2060 && r <= 0x206f) ||
+		r == 0x180e || r == 0xfeff
 }
 
 func splitMessage(text string, limit int) []string {
