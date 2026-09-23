@@ -121,6 +121,26 @@ func TestRecordUserMessageStartsNewConversationAtSevenDayBoundary(t *testing.T) 
 	}
 }
 
+func TestRecordUserMessageRemainsActiveJustBeforeSevenDayBoundary(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := openRepositoryForTest(t)
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	first := testUserMessage(nil, "dm-1", "user-1", "before-boundary-1", "first", start)
+	firstID, err := repo.RecordUserMessage(ctx, first, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextAt := start.Add(conversationTTL - time.Nanosecond)
+	second := testUserMessage(nil, "dm-1", "user-1", "before-boundary-2", "second", nextAt)
+	secondID, err := repo.RecordUserMessage(ctx, second, nextAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID != secondID {
+		t.Fatalf("conversation changed immediately before expiry: %q -> %q", firstID, secondID)
+	}
+}
+
 func TestRecordUserMessageSeparatesConversationKeys(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := openRepositoryForTest(t)

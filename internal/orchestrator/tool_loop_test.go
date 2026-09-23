@@ -285,6 +285,26 @@ func TestToolResultBudgetStopsAtRequestWideLimit(t *testing.T) {
 	}
 }
 
+func TestToolResultBudgetSharesRemainingSpaceAcrossFetchPages(t *testing.T) {
+	budget := toolResultBudget{counter: &fakeLoopLLM{}}
+	page := []byte(strings.Repeat("p", maxFetchPageTokens))
+	first, truncated, _, err := budget.fit(context.Background(), "fetch_page", nil, page)
+	if err != nil || truncated {
+		t.Fatalf("first page truncated=%v err=%v", truncated, err)
+	}
+	second, truncated, _, err := budget.fit(context.Background(), "fetch_page", []chat.Message{{Role: "tool", Content: first}}, page)
+	if err != nil || truncated {
+		t.Fatalf("second page truncated=%v err=%v", truncated, err)
+	}
+	third, truncated, _, err := budget.fit(context.Background(), "fetch_page", []chat.Message{{Role: "tool", Content: first}, {Role: "tool", Content: second}}, page)
+	if err != nil || !truncated {
+		t.Fatalf("third page truncation=%v err=%v", truncated, err)
+	}
+	if len(third) >= len(first) {
+		t.Fatalf("third page did not receive only remaining budget: %d >= %d", len(third), len(first))
+	}
+}
+
 func TestFetchPageTruncationDoesNotDisableOtherTools(t *testing.T) {
 	largeResult, err := json.Marshal(map[string]string{"page": strings.Repeat("p", maxFetchPageTokens+100)})
 	if err != nil {

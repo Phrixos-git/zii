@@ -67,6 +67,31 @@ func TestContextBuilderSelectsRecentCompleteTurns(t *testing.T) {
 	}
 }
 
+func TestContextBuilderUsesOnlyLatestFiveTurnsAndCountsHistoryOnly(t *testing.T) {
+	counter := &fakeTokenCounter{}
+	builder, err := NewContextBuilder(counter, 5, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := make([]storage.HistoryMessage, 0, 12)
+	for i := 1; i <= 6; i++ {
+		history = append(history, storage.HistoryMessage{Role: "user", Content: string(rune('0' + i))}, storage.HistoryMessage{Role: "assistant", Content: string(rune('a' + i - 1))})
+	}
+	got, err := builder.Build(context.Background(), "system prompt", "current message", history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 12 {
+		t.Fatalf("context has %d messages, want system + 5 turns + current user: %+v", len(got), got)
+	}
+	if got[1].Content != "2" || got[10].Content != "f" {
+		t.Fatalf("selected history range = %+v", got[1:11])
+	}
+	if len(counter.lastMessages) != 10 || counter.lastMessages[0].Content != "2" || counter.lastMessages[9].Content != "f" {
+		t.Fatalf("token count input included non-history or wrong turns: %+v", counter.lastMessages)
+	}
+}
+
 func TestContextBuilderReturnsTokenizerErrors(t *testing.T) {
 	wantErr := errors.New("tokenizer unavailable")
 	builder, err := NewContextBuilder(&fakeTokenCounter{err: wantErr}, 5, 8192)
