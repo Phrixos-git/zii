@@ -239,11 +239,14 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 }
 
 func prependConciseRetryInstruction(messages []chat.Message) []chat.Message {
-	instruction := chat.Message{
-		Role:    "system",
-		Content: "The previous response was cut off. Give a complete, substantially shorter answer using only the information already available. Do not call tools again.",
+	instruction := "The previous response was cut off. Give a complete, substantially shorter answer using only the information already available. Do not call tools again."
+	if len(messages) > 0 && messages[0].Role == "system" {
+		updated := make([]chat.Message, len(messages))
+		copy(updated, messages)
+		updated[0].Content = instruction + "\n\n" + updated[0].Content
+		return updated
 	}
-	return append([]chat.Message{instruction}, messages...)
+	return append([]chat.Message{{Role: "system", Content: instruction}}, messages...)
 }
 
 func (l *ToolLoop) invoke(ctx context.Context, name string, arguments json.RawMessage) (searchmcp.ToolResult, error) {
