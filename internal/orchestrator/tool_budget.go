@@ -20,6 +20,23 @@ const (
 
 var errToolContextFull = errors.New("orchestrator: tool context budget is full")
 
+// tokenCountUserMarker is a fixed non-empty synthetic user message prepended
+// to token-count-only requests. Some providers (e.g. llama.cpp
+// /input_tokens) reject messages without a user query, so tool-only budget
+// measurements must include it.
+const tokenCountUserMarker = "[tool result token counting]"
+
+// countMessages builds the token-count-only message sequence for a tool
+// result budget check: the fixed user marker, the relevant prior tool
+// messages, and the candidate tool result.
+func countMessages(previous []chat.Message, content string) []chat.Message {
+	messages := make([]chat.Message, 0, len(previous)+2)
+	messages = append(messages, chat.Message{Role: "user", Content: tokenCountUserMarker})
+	messages = append(messages, previous...)
+	messages = append(messages, chat.Message{Role: "tool", Content: content})
+	return messages
+}
+
 type toolResultBudget struct {
 	counter TokenCounter
 }
@@ -73,7 +90,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 	if best == "" {
 		return "", false, true, errToolContextFull
 	}
-	used, err := b.counter.CountTokens(ctx, append(append([]chat.Message(nil), previous...), chat.Message{Role: "tool", Content: best}))
+	used, err := b.counter.CountTokens(ctx, countMessages(previous, best))
 	if err != nil {
 		return "", false, false, fmt.Errorf("orchestrator: count truncated tool context: %w", err)
 	}
@@ -85,10 +102,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 }
 
 func (b toolResultBudget) fits(ctx context.Context, previous []chat.Message, content string, page bool) (bool, error) {
-	candidate := make([]chat.Message, 0, len(previous)+1)
-	candidate = append(candidate, previous...)
-	candidate = append(candidate, chat.Message{Role: "tool", Content: content})
-	totalTokens, err := b.counter.CountTokens(ctx, candidate)
+	totalTokens, err := b.counter.CountTokens(ctx, countMessages(previous, content))
 	if err != nil {
 		return false, fmt.Errorf("orchestrator: count tool result context: %w", err)
 	}
@@ -99,7 +113,7 @@ func (b toolResultBudget) fits(ctx context.Context, previous []chat.Message, con
 		return false, nil
 	}
 	if page {
-		pageTokens, err := b.counter.CountTokens(ctx, []chat.Message{{Role: "tool", Content: content}})
+		pageTokens, err := b.counter.CountTokens(ctx, countMessages(nil, content))
 		if err != nil {
 			return false, fmt.Errorf("orchestrator: count fetch_page result: %w", err)
 		}

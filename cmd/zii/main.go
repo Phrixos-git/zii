@@ -75,7 +75,7 @@ func run() error {
 		_ = db.Close()
 		return err
 	}
-	toolMax, err := envInt("TOOL_MAX_CALLS", 7)
+	toolMax, err := envInt("TOOL_MAX_CALLS", 3)
 	if err != nil {
 		_ = searchClient.Close()
 		_ = db.Close()
@@ -87,13 +87,13 @@ func run() error {
 		_ = db.Close()
 		return err
 	}
-	webMax, err := envInt("SEARCH_WEB_MAX_CALLS", 2)
+	webMax, err := envInt("SEARCH_WEB_MAX_CALLS", 1)
 	if err != nil {
 		_ = searchClient.Close()
 		_ = db.Close()
 		return err
 	}
-	fetchMax, err := envInt("FETCH_PAGE_MAX_CALLS", 3)
+	fetchMax, err := envInt("FETCH_PAGE_MAX_CALLS", 2)
 	if err != nil {
 		_ = searchClient.Close()
 		_ = db.Close()
