@@ -36,6 +36,15 @@ type Completion struct {
 	FinishReason string
 }
 
+// ChatOptions overrides generation parameters for one request. Zero values
+// leave the client's normal request settings unchanged.
+type ChatOptions struct {
+	MaxTokens            int
+	ReasoningEffort      string
+	ThinkingBudgetTokens int
+	ToolChoice           string
+}
+
 // Close releases idle connections owned by the HTTP client during shutdown.
 func (c *Client) Close() error {
 	if c != nil && c.httpClient != nil {
@@ -49,6 +58,8 @@ type chatRequest struct {
 	Messages          []chat.Message `json:"messages"`
 	Stream            bool           `json:"stream"`
 	MaxTokens         int            `json:"max_tokens"`
+	ReasoningEffort   string         `json:"reasoning_effort,omitempty"`
+	ThinkingBudget    int            `json:"thinking_budget_tokens,omitempty"`
 	ToolChoice        string         `json:"tool_choice"`
 	ParallelToolCalls bool           `json:"parallel_tool_calls"`
 	Tools             []requestTool  `json:"tools,omitempty"`
@@ -67,6 +78,12 @@ type requestFunction struct {
 
 // Chat requests one non-streaming completion from the configured endpoint.
 func (c *Client) Chat(ctx context.Context, messages []chat.Message, tools []ToolDefinition) (Completion, error) {
+	return c.ChatWithOptions(ctx, messages, tools, ChatOptions{})
+}
+
+// ChatWithOptions requests one completion with optional per-request generation
+// overrides. It does not mutate the client's configured defaults.
+func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, tools []ToolDefinition, options ChatOptions) (Completion, error) {
 	if c == nil {
 		return Completion{}, errors.New("llm: client is nil")
 	}
@@ -76,12 +93,35 @@ func (c *Client) Chat(ctx context.Context, messages []chat.Message, tools []Tool
 	if len(messages) == 0 {
 		return Completion{}, fmt.Errorf("llm: messages must not be empty")
 	}
+	if options.MaxTokens < 0 {
+		return Completion{}, errors.New("llm: max tokens override must not be negative")
+	}
+	if options.ThinkingBudgetTokens < 0 {
+		return Completion{}, errors.New("llm: thinking budget override must not be negative")
+	}
+	toolChoice := strings.TrimSpace(options.ToolChoice)
+	if toolChoice != "" && toolChoice != "auto" && toolChoice != "none" {
+		return Completion{}, errors.New("llm: tool choice override must be auto or none")
+	}
+	if toolChoice == "" {
+		toolChoice = "auto"
+	}
+	reasoningEffort := strings.TrimSpace(options.ReasoningEffort)
+	if options.ReasoningEffort != "" && reasoningEffort == "" {
+		return Completion{}, errors.New("llm: reasoning effort override must not be blank")
+	}
+	maxTokens := c.maxTokens
+	if options.MaxTokens > 0 {
+		maxTokens = options.MaxTokens
+	}
 	request := chatRequest{
 		Model:             c.model,
 		Messages:          messages,
 		Stream:            false,
-		MaxTokens:         c.maxTokens,
-		ToolChoice:        "auto",
+		MaxTokens:         maxTokens,
+		ReasoningEffort:   reasoningEffort,
+		ThinkingBudget:    options.ThinkingBudgetTokens,
+		ToolChoice:        toolChoice,
 		ParallelToolCalls: false,
 	}
 	for _, tool := range tools {

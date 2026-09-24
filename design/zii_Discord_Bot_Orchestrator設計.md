@@ -507,7 +507,8 @@ tool_choice: auto
 parallel_tool_calls: false
 ```
 
-- Sampling系は初期段階ではOrchestratorから上書きせず、llama.cpp / Model側の設定を利用する。
+- 通常の初回RequestではSampling系をOrchestratorから上書きせず、llama.cpp / Model側の設定を利用する。
+- OR-13で定義する`finish_reason=length`後の短縮再試行に限り、再試行単位の生成設定で上書きする。通常RequestやClient共通設定は変更しない。
 - Function CallingはOpenAI形式の`tools`を使用する。
 - llama.cppでは`--jinja`とTool対応Chat TemplateによるOpenAI-style Function Callingがサポートされている。Parallel Tool Callingは明示的に有効化可能だが、初期版では無効にする。
 - `finish_reason`：
@@ -968,7 +969,19 @@ contentが空でない
 ```
 
 - `finish_reason=length`は最終回答とみなさない。
-- `length`時は**1回だけ短縮再生成**を行う。
+- 初回が`length`の場合は、**既に取得したTool Resultだけを圧縮**して1回だけ回答を再試行する。再試行のためにSearch MCPを呼び直したり、別のLLM要約を実行したりしない。
+- 圧縮ではTool Messageの対応関係を維持し、Tool Result全体を4,096 tokens以内に収める。収まらない結果は切り詰めたことを明示し、利用可能な証拠の範囲で結論を出す。
+- 再試行ではToolを無効にし、Requestに`tool_choice=none`を設定する。System指示で「調査結果から結論を直接回答する」こと、既存の証拠だけを使うこと、証拠が不足する場合はその旨を明示すること、tool呼び出し記法を本文へ出力しないことを指示する。
+- 再試行の`stop`本文に`<tool_call>`、`<function=...>`、`<parameter=...>`形式が含まれる場合は回答として扱わずエラーにする。
+- 再試行Requestだけに以下を設定する。
+
+```text
+reasoning_effort = medium
+thinking_budget_tokens = 2048
+max_tokens = 1536
+```
+
+- 通常Requestは既定の`max_tokens=4096`を使い、`reasoning_effort`と`thinking_budget_tokens`を送らない。
 - 2回目も`length`なら、途中出力を正常回答として保存せずエラー扱い。
 - 最終回答確定後、Discord Adapterへ：
 

@@ -4,6 +4,7 @@
 !.env.example
 
 # Databases
+/data/
 *.db
 *.db-shm
 *.db-wal
@@ -28,4 +29,3 @@ coverage/
 /dist/
 *.test
 coverage.out
-

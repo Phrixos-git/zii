@@ -125,14 +125,31 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			return "", ctx.Err()
 		}
 		started := time.Now()
-		completion, err := l.llm.Chat(ctx, messages, definitions)
+		var completion llm.Completion
+		var err error
+		if shortenedRetryUsed {
+			if client, ok := l.llm.(interface {
+				ChatWithOptions(context.Context, []chat.Message, []llm.ToolDefinition, llm.ChatOptions) (llm.Completion, error)
+			}); ok {
+				completion, err = client.ChatWithOptions(ctx, messages, definitions, truncatedRetryOptions)
+			} else {
+				// Keep alternate ChatClient implementations usable. The application
+				// LLM client supports per-request options and takes the branch above.
+				completion, err = l.llm.Chat(ctx, messages, definitions)
+			}
+		} else {
+			completion, err = l.llm.Chat(ctx, messages, definitions)
+		}
 		<-l.llmSlots
 		if err != nil {
 			slog.Warn("LLM request failed", "component", "orchestrator", "event", "llm_request_failed", "request_id", RequestIDFromContext(ctx), "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "llm_error")
 			if errors.Is(err, llm.ErrTruncated) && !shortenedRetryUsed {
+				messages, err = l.prepareTruncatedRetry(ctx, messages)
+				if err != nil {
+					return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
+				}
 				shortenedRetryUsed = true
 				toolsDisabled = true
-				messages = prependConciseRetryInstruction(messages)
 				continue
 			}
 			return "", fmt.Errorf("orchestrator: LLM completion: %w", err)
@@ -150,6 +167,9 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			if answer == "" {
 				return "", errors.New("orchestrator: final answer is empty")
 			}
+			if shortenedRetryUsed && containsToolCallMarkup(answer) {
+				return "", errors.New("orchestrator: truncated-response retry returned tool-call markup instead of an answer")
+			}
 			return answer, nil
 		case "tool_calls":
 			if completion.Message.Role != "assistant" || len(completion.Message.ToolCalls) != 1 {
@@ -159,9 +179,12 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			if shortenedRetryUsed {
 				return "", llm.ErrTruncated
 			}
+			messages, err = l.prepareTruncatedRetry(ctx, messages)
+			if err != nil {
+				return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
+			}
 			shortenedRetryUsed = true
 			toolsDisabled = true
-			messages = prependConciseRetryInstruction(messages)
 			continue
 		default:
 			return "", fmt.Errorf("orchestrator: unsupported LLM finish reason %q", completion.FinishReason)
@@ -238,8 +261,23 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 	return "", errors.New("orchestrator: tool loop exceeded its inference limit")
 }
 
+var truncatedRetryOptions = llm.ChatOptions{
+	MaxTokens:            1536,
+	ReasoningEffort:      "medium",
+	ThinkingBudgetTokens: 2048,
+	ToolChoice:           "none",
+}
+
+func (l *ToolLoop) prepareTruncatedRetry(ctx context.Context, messages []chat.Message) ([]chat.Message, error) {
+	compacted, err := compactToolResults(ctx, l.budget.counter, messages)
+	if err != nil {
+		return nil, err
+	}
+	return prependConciseRetryInstruction(compacted), nil
+}
+
 func prependConciseRetryInstruction(messages []chat.Message) []chat.Message {
-	instruction := "The previous response was cut off. Give a complete, substantially shorter answer using only the information already available. Do not call tools again."
+	instruction := "The previous response reached its output limit. Do not restart the investigation. Give the conclusion directly using only the evidence already collected, and do not call tools or seek new evidence. Never output tool-call markup or syntax as text, including <tool_call>, <function=...>, or <parameter=...>. Keep the answer substantially shorter and preserve source URLs or citations present in the evidence. If the evidence is insufficient, say so clearly. Answer in the user's language."
 	if len(messages) > 0 && messages[0].Role == "system" {
 		updated := make([]chat.Message, len(messages))
 		copy(updated, messages)
@@ -247,6 +285,11 @@ func prependConciseRetryInstruction(messages []chat.Message) []chat.Message {
 		return updated
 	}
 	return append([]chat.Message{{Role: "system", Content: instruction}}, messages...)
+}
+
+func containsToolCallMarkup(answer string) bool {
+	answer = strings.ToLower(answer)
+	return strings.Contains(answer, "<tool_call>") || strings.Contains(answer, "<function=") || strings.Contains(answer, "<parameter=")
 }
 
 func (l *ToolLoop) invoke(ctx context.Context, name string, arguments json.RawMessage) (searchmcp.ToolResult, error) {
