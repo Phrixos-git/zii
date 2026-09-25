@@ -17,12 +17,17 @@ type serviceRepo struct {
 	history        []storage.HistoryMessage
 	conversationID string
 	userCalls      int
+	duplicate      bool
+	duplicateErr   error
 	assistant      *storage.AssistantMessage
 	userErr        error
 	historyErr     error
 	assistantErr   error
 }
 
+func (r *serviceRepo) HasDiscordMessage(context.Context, string) (bool, error) {
+	return r.duplicate, r.duplicateErr
+}
 func (r *serviceRepo) RecordUserMessage(_ context.Context, in storage.UserMessage, now time.Time) (string, error) {
 	r.userCalls++
 	r.user, r.now = in, now
@@ -124,5 +129,69 @@ func TestServiceReturnsErrorsWithoutPersistingAssistant(t *testing.T) {
 	_, err := service.Process(context.Background(), Request{RequestID: "r", DiscordMessageID: "d", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()})
 	if err == nil || repo.assistant != nil || len(client.requests) != 0 {
 		t.Fatalf("Process err=%v assistant=%+v calls=%d", err, repo.assistant, len(client.requests))
+	}
+}
+
+func TestProcessQueuedWithAcceptedRejectsDuplicateBeforeAcceptance(t *testing.T) {
+	repo := &serviceRepo{conversationID: "c", duplicate: true}
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, err := NewService(repo, client, loop, ServiceConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := NewRequestQueue(QueueConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = queue.Shutdown(context.Background()) })
+	accepted := false
+	request := Request{RequestID: "r", DiscordMessageID: "duplicate", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	err = service.ProcessQueuedWithAccepted(context.Background(), queue, request, func(context.Context) error {
+		accepted = true
+		return nil
+	}, nil)
+	if !errors.Is(err, storage.ErrDuplicateDiscordMessage) || accepted || repo.userCalls != 0 || len(client.requests) != 0 {
+		t.Fatalf("duplicate err=%v accepted=%t userCalls=%d llmCalls=%d", err, accepted, repo.userCalls, len(client.requests))
+	}
+}
+
+func TestProcessQueuedWithAcceptedRunsBeforeOrchestrationAndStopsOnError(t *testing.T) {
+	for _, failAdmission := range []bool{false, true} {
+		repo := &serviceRepo{conversationID: "c"}
+		client := &serviceChat{result: "answer"}
+		loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+		service, err := NewService(repo, client, loop, ServiceConfig{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		queue, err := NewRequestQueue(QueueConfig{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := Request{RequestID: "r", DiscordMessageID: "unique", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+		admissionErr := errors.New("receipt delivery failed")
+		admitted := false
+		err = service.ProcessQueuedWithAccepted(context.Background(), queue, request, func(context.Context) error {
+			admitted = true
+			if repo.userCalls != 0 || len(client.requests) != 0 {
+				t.Fatal("orchestration started before acceptance callback")
+			}
+			if failAdmission {
+				return admissionErr
+			}
+			return nil
+		}, nil)
+		_ = queue.Shutdown(context.Background())
+		if !admitted {
+			t.Fatal("acceptance callback was not called")
+		}
+		if failAdmission {
+			if !errors.Is(err, admissionErr) || repo.userCalls != 0 || len(client.requests) != 0 {
+				t.Fatalf("failed admission err=%v userCalls=%d llmCalls=%d", err, repo.userCalls, len(client.requests))
+			}
+		} else if err != nil || repo.userCalls != 1 || len(client.requests) != 1 {
+			t.Fatalf("successful admission err=%v userCalls=%d llmCalls=%d", err, repo.userCalls, len(client.requests))
+		}
 	}
 }

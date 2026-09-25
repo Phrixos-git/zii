@@ -24,7 +24,7 @@ Discord BotからLocal LLMを利用し、以下を実現する。
 - 直近のConversation履歴をLLM Contextへ渡す
 - LLMが必要と判断した場合のみSearch MCPを利用する
 - Search MCPの結果をLLMへ再投入する
-- 最終回答を元のDiscord MessageへのReplyとして返す
+- Queue受付後に受付Replyを送り、最終回答は受付ReplyをEditして返す
 - 必要な場合は回答後の行動・判断材料も提示する
 
 ## 現在の構成
@@ -144,7 +144,7 @@ Conversation Key
     → Orchestrator内部で履歴を関連付ける
 ```
 
-Botの最終回答は元のUser MessageへのReplyとして送信する。
+BotはQueue受付後に元のUser MessageへのProcessing Replyを送り、最終回答はそのMessageをEditして表示する。長文の追加chunkは元のUser MessageへのReplyとして送信する。
 
 ### SQLite
 
@@ -983,6 +983,7 @@ max_tokens = 1536
 
 - 通常Requestは既定の`max_tokens=4096`を使い、`reasoning_effort`と`thinking_budget_tokens`を送らない。
 - 2回目も`length`なら、途中出力を正常回答として保存せずエラー扱い。
+- Request Queueへの登録成功後、Discord AdapterはLLM処理前に元User MessageへのProcessing Replyを送る。送信に失敗した場合はOrchestrator処理を開始しない。
 - 最終回答確定後、Discord Adapterへ：
 
 ```
@@ -993,17 +994,15 @@ content
 
 を渡す。
 
-- Discord送信成功後にBot側`discord_message_id`を取得。
+- Discord Adapterは最終回答の先頭chunkでProcessing ReplyをEditする。長文の場合は残りchunkを元User MessageへのReplyとして送信する。
+- Processing Reply、最終回答、Error Messageはmessagesテーブルへ進捗状態として保存しない。成功した最終回答だけをAssistant Messageとして保存する。
+- 全chunk反映に成功した後、Bot側`DiscordReplyResult.discord_message_id`と`created_at`にはProcessing ReplyのMessage IDと作成時刻を設定する。
 - その後SQLiteへ：
 
 ```
 role = assistant
 discord_message_id =
-    通常Reply：
-        Discordから返ったReply Message ID
-    分割Reply：
-        Discord Botから返された代表Reply Message ID
-        （最初のReply Message ID）
+    Processing ReplyのMessage ID
 content =
     分割前の最終回答全文
 conversation_id =

@@ -5,8 +5,6 @@ import (
 	"strings"
 )
 
-const unsafeOutputReply = "回答の安全性を確認できないため、この内容は送信できません。別の質問をお試しください。"
-
 var sensitiveOutputPatterns = []struct {
 	name    string
 	pattern *regexp.Regexp

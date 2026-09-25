@@ -195,6 +195,34 @@ func TestRecordUserMessageDuplicateDoesNotRefreshTTL(t *testing.T) {
 	}
 }
 
+func TestHasDiscordMessageFindsExistingRowsWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	repo, db := openRepositoryForTest(t)
+	exists, err := repo.HasDiscordMessage(ctx, "not-yet-stored")
+	if err != nil || exists {
+		t.Fatalf("missing Discord message = %t, %v", exists, err)
+	}
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	message := testUserMessage(nil, "dm", "user", "stored-message", "question", now)
+	if _, err := repo.RecordUserMessage(ctx, message, now); err != nil {
+		t.Fatal(err)
+	}
+	exists, err = repo.HasDiscordMessage(ctx, message.DiscordMessageID)
+	if err != nil || !exists {
+		t.Fatalf("stored Discord message = %t, %v", exists, err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM messages`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("preflight query changed message count = %d, err=%v", count, err)
+	}
+	if _, err := repo.HasDiscordMessage(ctx, " "); err == nil {
+		t.Fatal("blank Discord message ID was accepted")
+	}
+	if _, err := repo.HasDiscordMessage(nil, "id"); err == nil {
+		t.Fatal("nil context was accepted")
+	}
+}
+
 func TestRecordUserMessageRejectsInvalidInputWithoutWrites(t *testing.T) {
 	ctx := context.Background()
 	repo, db := openRepositoryForTest(t)

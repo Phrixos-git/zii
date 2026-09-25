@@ -102,6 +102,19 @@ func (s discordSender) Reply(_ context.Context, replyTo, channelID, content stri
 	return SentMessage{ID: sent.ID, CreatedAt: sent.Timestamp.UTC()}, nil
 }
 
+func (s discordSender) Edit(_ context.Context, channelID, messageID, content string) error {
+	_, err := s.session.ChannelMessageEdit(channelID, messageID, content)
+	if err != nil {
+		var rest *discordgo.RESTError
+		if errors.As(err, &rest) && rest.Response != nil {
+			delay, _ := strconv.ParseFloat(rest.Response.Header.Get("Retry-After"), 64)
+			return discordAPIError{cause: err, status: rest.Response.StatusCode, retryAfter: time.Duration(delay * float64(time.Second))}
+		}
+		return err
+	}
+	return nil
+}
+
 func boolPointer(value bool) *bool { return &value }
 
 type discordAPIError struct {

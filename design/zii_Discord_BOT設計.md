@@ -281,17 +281,26 @@ BotResponse
 
 - 状態：**決定**
 - 決めたいこと：
-    - 最終回答をどう送信するか
+    - 受付通知と最終回答をどう送信するか
 - 決定内容：
-    - 必ず元User Messageへの**Reply**として送信する。
+    - Input Validation、Rate Limit、Duplicate / in-flight確認、Request Queue登録に成功した後、元User MessageへのReplyとして受付通知を送る。
+    - 受付通知の本文は`質問を受け付けました。回答を生成しています。`とする。
+    - 受付通知の送信成功後にOrchestrator処理を開始する。受付通知はmessagesテーブルへ保存しない。
+    - 最終回答の先頭部分は受付通知をEditして表示する。
+    - 受付後に処理またはOutput Validationが失敗した場合も、受付通知を安全なError MessageへEditする。
 
 ```
 User Message
     ↓
-Bot Reply
+Processing Reply
+    ↓ Edit
+Final Answer
 ```
 
-- Botが独立した新規Messageとして回答しない。
+- 短い回答では追加Messageを送らない。
+- 長文回答では、先頭chunkをProcessing ReplyへEditし、2件目以降を元User MessageへのReplyとして送信する。
+- Processing Replyを削除しない。長文Replyの途中失敗時は`partial_reply`として全体を失敗扱いにし、Assistant Messageを保存しない。
+- Assistantの代表Message IDと`created_at`には、Processing ReplyのMessage IDと作成時刻を使う。
 - Discord Messageは通常最大2,000文字なので、回答が超える場合は分割する。
 - Bot側の安全上限：
 
@@ -314,13 +323,13 @@ Bot Reply
 の順で切る。
 
 -  長文Replyの成功条件
-	- 分割された全Messageの送信成功をもってReply全体を成功とする
+	- Processing Replyへの先頭chunkのEditと、残り全chunkの送信成功をもってReply全体を成功とする
 	- 全Message成功時：
-	  - 最初のReply Message IDを代表IDとしてOrchestratorへ返す
+	  - Processing ReplyのMessage IDを代表IDとしてOrchestratorへ返す
 		  - 分割Reply時のMessage ID管理
 			  - 分割された各Discord Messageはそれぞれ固有のMessage IDを持つ。
 			  - 初期実装では複数IDを個別保存しない。
-			  - 最初のReply Message IDを代表IDとしてOrchestratorへ返す。
+			  - Processing ReplyのMessage IDを代表IDとしてOrchestratorへ返す。
 			  - この代表IDは、Assistant回答全体を代表するdiscord_message_idとして扱う。
 			  - SQLiteのmessages.contentには分割前の最終回答全文を保存する。
 			  - したがってAssistantのdiscord_message_idとcontentは、
@@ -340,11 +349,12 @@ Bot Reply
 	    → discord_message_id / created_at 必須
 	success = false
 	    → discord_message_id / created_at はNULL許可
-- 分割Replyの場合のは以下
+
+- 分割Replyの場合：
 	- discord_message_id
-		= 最初のReply Message ID
+			= Processing ReplyのMessage ID
 	- created_at
-		= 最初のReply Messageの作成時刻
+			= Processing Replyの作成時刻
 
 - 決定理由：
     - ユーザーがどの質問への回答か明確に確認できる。
@@ -397,7 +407,7 @@ messages.discord_message_id UNIQUE
     - Discord Client LibraryのRate Limit処理を優先利用する。
     - 独自に固定待ち時間をハードコードしない。
     - HTTP 429ではDiscordが返す`retry_after`を必ず尊重する。Discordもこれを推奨している。
-    - Reply送信のRetry対象：
+    - Processing Reply送信、Final Answer Edit、追加Reply送信のRetry対象：
 
 ```
 429

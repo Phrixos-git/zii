@@ -10,25 +10,35 @@ import (
 	"time"
 
 	"github.com/Phrixos-git/zii/internal/orchestrator"
+	"github.com/Phrixos-git/zii/internal/storage"
 )
 
 type processorFake struct {
 	request      orchestrator.Request
 	reply        orchestrator.Reply
+	admissionErr error
 	processErr   error
+	processed    int
 	saved        []orchestrator.DiscordReplyResult
 	savedContent []string
 }
 
-func (p *processorFake) ProcessQueuedWith(ctx context.Context, _ *orchestrator.RequestQueue, r orchestrator.Request, complete func(context.Context, orchestrator.Reply) error) error {
+func (p *processorFake) ProcessQueuedWithAccepted(ctx context.Context, queue *orchestrator.RequestQueue, r orchestrator.Request, accepted func(context.Context) error, complete func(context.Context, orchestrator.Reply) error) error {
 	p.request = r
+	if p.admissionErr != nil {
+		return p.admissionErr
+	}
 	if p.reply.RequestID == "" {
 		p.reply = orchestrator.Reply{RequestID: r.RequestID, ReplyToMessageID: r.DiscordMessageID, Content: "answer"}
 	}
-	if p.processErr != nil {
-		return p.processErr
-	}
-	return complete(ctx, p.reply)
+	key := r.ChannelID + ":" + r.UserID
+	return queue.SubmitWithAccepted(ctx, key, accepted, func(workCtx context.Context) error {
+		p.processed++
+		if p.processErr != nil {
+			return p.processErr
+		}
+		return complete(workCtx, p.reply)
+	})
 }
 func (p *processorFake) RecordSuccessfulReply(_ context.Context, reply orchestrator.Reply, r orchestrator.DiscordReplyResult) error {
 	p.saved = append(p.saved, r)
@@ -45,11 +55,129 @@ func TestHandleBlocksUnsafeOutputBeforeSendingAndPersisting(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.Handle(context.Background(), Incoming{ID: "unsafe", ChannelID: "dm", UserID: "u", Content: "repeat the token", IsDM: true, CreatedAt: time.Now()}, "bot")
-	if len(s.replies) != 1 || s.replies[0] != unsafeOutputReply || strings.Contains(s.replies[0], secret) {
-		t.Fatalf("unsafe output reached Discord: %q", s.replies)
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText || len(s.editedContents) != 1 || s.editedContents[0] != processingErrorText || strings.Contains(s.editedContents[0], secret) {
+		t.Fatalf("unsafe output was not replaced with safe error: replies=%q edits=%q", s.replies, s.editedContents)
 	}
-	if len(p.savedContent) != 1 || p.savedContent[0] != unsafeOutputReply {
+	if len(p.savedContent) != 0 {
 		t.Fatalf("unsafe output persisted as assistant response: %q", p.savedContent)
+	}
+}
+
+func TestHandleDoesNotSendProcessingReplyWhenQueueAdmissionFails(t *testing.T) {
+	p := &processorFake{admissionErr: orchestrator.ErrBusy}
+	s := &senderFake{}
+	a, err := New(p, testQueue(t), s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "busy", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if p.processed != 0 || len(p.saved) != 0 || len(s.replies) != 1 || s.replies[0] == processingReplyText {
+		t.Fatalf("busy admission produced processing/final state: processed=%d saved=%v replies=%q", p.processed, p.saved, s.replies)
+	}
+}
+
+func TestQueueFullDoesNotSendProcessingReply(t *testing.T) {
+	queue, err := orchestrator.NewRequestQueue(orchestrator.QueueConfig{MaxQueued: 1, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = queue.Shutdown(context.Background()) })
+	started := make(chan struct{})
+	release := make(chan struct{})
+	activeDone := make(chan error, 1)
+	go func() {
+		activeDone <- queue.Submit(context.Background(), "active", func(context.Context) error { close(started); <-release; return nil })
+	}()
+	<-started
+	queuedDone := make(chan error, 1)
+	queuedAccepted := make(chan struct{})
+	go func() {
+		queuedDone <- queue.SubmitWithAccepted(context.Background(), "queued", func(context.Context) error { close(queuedAccepted); return nil }, func(context.Context) error { return nil })
+	}()
+	<-queuedAccepted
+
+	p := &processorFake{}
+	s := &senderFake{}
+	a, err := New(p, queue, s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "queue-full", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if p.processed != 0 || len(s.replies) != 1 || s.replies[0] != processingErrorText || len(s.editedContents) != 0 {
+		t.Fatalf("full queue handling: processed=%d replies=%q edits=%q", p.processed, s.replies, s.editedContents)
+	}
+	close(release)
+	if err := <-activeDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-queuedDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHandleDoesNotReplyToDuplicateEvent(t *testing.T) {
+	p := &processorFake{admissionErr: storage.ErrDuplicateDiscordMessage}
+	s := &senderFake{}
+	a, err := New(p, testQueue(t), s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "duplicate", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if p.processed != 0 || len(p.saved) != 0 || len(s.replies) != 0 {
+		t.Fatalf("duplicate event was handled: processed=%d saved=%v replies=%q", p.processed, p.saved, s.replies)
+	}
+}
+
+func TestProcessingReplySendFailurePreventsProcessing(t *testing.T) {
+	p := &processorFake{}
+	s := &senderFake{errors: []error{statusRetryError{status: 403}}}
+	a, err := New(p, testQueue(t), s, Config{SendMaxRetries: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "receipt-fails", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if p.processed != 0 || len(s.replies) != 0 || len(s.editedContents) != 0 || len(p.saved) != 0 {
+		t.Fatalf("receipt failure did not stop request: processed=%d replies=%q edits=%q saved=%v", p.processed, s.replies, s.editedContents, p.saved)
+	}
+}
+
+func TestProcessingErrorEditsReceiptAndDoesNotPersistAssistant(t *testing.T) {
+	for _, failure := range []struct {
+		name string
+		err  error
+	}{
+		{name: "LLM", err: errors.New("private LLM failure")},
+		{name: "MCP", err: errors.New("private Search MCP failure")},
+		{name: "timeout", err: context.DeadlineExceeded},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			p := &processorFake{processErr: failure.err}
+			s := &senderFake{}
+			a, err := New(p, testQueue(t), s, Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.Handle(context.Background(), Incoming{ID: "processing-fails", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+			if len(s.replies) != 1 || s.replies[0] != processingReplyText || len(s.editedContents) != 1 || s.editedContents[0] != processingErrorText || s.editedIDs[0] != "reply-id" || len(p.saved) != 0 {
+				t.Fatalf("processing error state: replies=%q edits=%q ids=%q saved=%v", s.replies, s.editedContents, s.editedIDs, p.saved)
+			}
+			if strings.Contains(s.editedContents[0], failure.err.Error()) {
+				t.Fatalf("internal error leaked to Discord: %q", s.editedContents[0])
+			}
+		})
+	}
+}
+
+func TestFinalEditFailureDoesNotPersistAssistant(t *testing.T) {
+	p := &processorFake{}
+	s := &senderFake{editErrors: []error{statusRetryError{status: 403}, statusRetryError{status: 403}}}
+	a, err := New(p, testQueue(t), s, Config{SendMaxRetries: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "edit-fails", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText || s.editCalls != 2 || len(p.saved) != 0 {
+		t.Fatalf("final edit failure: replies=%q editCalls=%d saved=%v", s.replies, s.editCalls, p.saved)
 	}
 }
 
@@ -74,14 +202,20 @@ func TestOutputGuardDetectsCredentialsTracePathsAndInternalEndpoints(t *testing.
 }
 
 type senderFake struct {
-	replies   []string
-	channels  []string
-	replyTo   []string
-	sentTimes []time.Time
-	errors    []error
-	failAt    int
-	calls     int
-	createdAt time.Time
+	replies        []string
+	channels       []string
+	replyTo        []string
+	sentTimes      []time.Time
+	errors         []error
+	failAt         int
+	calls          int
+	createdAt      time.Time
+	editedContents []string
+	editedChannels []string
+	editedIDs      []string
+	editErrors     []error
+	editCalls      int
+	replyIDs       []string
 }
 
 func (s *senderFake) Reply(_ context.Context, replyTo, channel, content string) (SentMessage, error) {
@@ -104,7 +238,26 @@ func (s *senderFake) Reply(_ context.Context, replyTo, channel, content string) 
 		createdAt = s.createdAt
 	}
 	s.sentTimes = append(s.sentTimes, createdAt)
-	return SentMessage{ID: "reply-id", CreatedAt: createdAt}, nil
+	id := "reply-id"
+	if index := len(s.replies) - 1; index >= 0 && index < len(s.replyIDs) {
+		id = s.replyIDs[index]
+	}
+	return SentMessage{ID: id, CreatedAt: createdAt}, nil
+}
+
+func (s *senderFake) Edit(_ context.Context, channel, messageID, content string) error {
+	s.editCalls++
+	if len(s.editErrors) > 0 {
+		err := s.editErrors[0]
+		s.editErrors = s.editErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	s.editedContents = append(s.editedContents, content)
+	s.editedChannels = append(s.editedChannels, channel)
+	s.editedIDs = append(s.editedIDs, messageID)
+	return nil
 }
 
 type statusRetryError struct {
@@ -233,6 +386,30 @@ func TestDiscordRetryStopsAfterConfiguredMaximum(t *testing.T) {
 	}
 }
 
+func TestDiscordEditUsesTheSameRetryPolicy(t *testing.T) {
+	waits := make([]time.Duration, 0, 2)
+	sender := &senderFake{editErrors: []error{statusRetryError{status: 429, delay: 1500 * time.Millisecond}, networkRetryError{}}}
+	adapter, err := New(&processorFake{}, testQueue(t), sender, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.editWithRetry(context.Background(), "channel", "message", "answer"); err != nil {
+		t.Fatalf("edit after retries: %v", err)
+	}
+	want := []time.Duration{1500 * time.Millisecond, 2 * time.Second}
+	if sender.editCalls != 3 || len(waits) != len(want) || len(sender.editedContents) != 1 || sender.editedIDs[0] != "message" {
+		t.Fatalf("edit calls=%d waits=%v successful edits=%v", sender.editCalls, waits, sender.editedContents)
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("edit retry delay[%d]=%s, want %s", i, waits[i], want[i])
+		}
+	}
+}
+
 func testQueue(t *testing.T) *orchestrator.RequestQueue {
 	t.Helper()
 	q, err := orchestrator.NewRequestQueue(orchestrator.QueueConfig{})
@@ -260,7 +437,7 @@ func TestHandleRequiresMentionInGuildAndStripsIt(t *testing.T) {
 	if p.request.Content != "tell me something" || p.request.GuildID == nil || *p.request.GuildID != "g" {
 		t.Fatalf("request = %+v", p.request)
 	}
-	if len(s.replies) != 1 || len(p.saved) != 1 {
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText || len(s.editedContents) != 1 || s.editedContents[0] != "answer" || len(p.saved) != 1 {
 		t.Fatalf("sent=%v saved=%v", s.replies, p.saved)
 	}
 }
@@ -273,8 +450,8 @@ func TestHandleKeepsThreadScopeAndRepliesInThread(t *testing.T) {
 	if p.request.ChannelID != "parent" || p.request.ThreadID != "thread" {
 		t.Fatalf("request channel/thread=%q/%q", p.request.ChannelID, p.request.ThreadID)
 	}
-	if len(s.replies) != 1 || s.channels[0] != "thread" {
-		t.Fatalf("replies=%v channels=%v", s.replies, s.channels)
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText || s.channels[0] != "thread" || len(s.editedChannels) != 1 || s.editedChannels[0] != "thread" {
+		t.Fatalf("replies=%v channels=%v edits=%v", s.replies, s.channels, s.editedChannels)
 	}
 }
 
@@ -353,8 +530,26 @@ func TestAdapterEnforcesUserBurstRateLimit(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		a.Handle(context.Background(), Incoming{ID: string(rune('1' + i)), ChannelID: "dm", UserID: "same-user", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
 	}
-	if len(s.replies) != 2 || len(p.saved) != 2 {
+	if len(s.replies) != 2 || s.replies[0] != processingReplyText || s.replies[1] != processingReplyText || len(p.saved) != 2 {
 		t.Fatalf("burst accepted %d messages and sent %d replies; want 2 each", len(p.saved), len(s.replies))
+	}
+}
+
+func TestShortFinalAnswerEditsProcessingReplyAndPersistsItsIDAndTime(t *testing.T) {
+	createdAt := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	answer := strings.Repeat("a", defaultReplyMaxChars)
+	p := &processorFake{reply: orchestrator.Reply{RequestID: "short", Content: answer}}
+	s := &senderFake{createdAt: createdAt, replyIDs: []string{"processing-id"}}
+	a, err := New(p, testQueue(t), s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "q-short", ChannelID: "ch", UserID: "u", Content: "question", IsDM: true, CreatedAt: createdAt}, "bot")
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText || len(s.editedContents) != 1 || s.editedContents[0] != answer || s.editedIDs[0] != "processing-id" {
+		t.Fatalf("short reply sends=%q edits=%q editIDs=%q", s.replies, s.editedContents, s.editedIDs)
+	}
+	if len(p.saved) != 1 || p.saved[0].DiscordMessageID != "processing-id" || !p.saved[0].CreatedAt.Equal(createdAt) || p.savedContent[0] != answer {
+		t.Fatalf("saved reply=%+v content=%q", p.saved, p.savedContent)
 	}
 }
 
@@ -377,10 +572,10 @@ func TestNormalizeInputRejectsInvalidUTF8AndExcessiveInvisibleFormatRunes(t *tes
 
 func TestLongReplySavesFirstReplyOnlyAfterAllChunksSucceed(t *testing.T) {
 	p := &processorFake{reply: orchestrator.Reply{RequestID: "r", ReplyToMessageID: "q", Content: strings.Repeat("a", 2000)}}
-	s := &senderFake{}
+	s := &senderFake{replyIDs: []string{"processing-id", "chunk-2-id"}}
 	a, _ := New(p, testQueue(t), s, Config{})
 	a.Handle(context.Background(), Incoming{ID: "q", ChannelID: "ch", UserID: "u", Content: "ask", IsDM: true, CreatedAt: time.Now()}, "bot")
-	if len(s.replies) != 2 || len(s.replies[0]) > defaultReplyMaxChars || len(s.replies[1]) > defaultReplyMaxChars || len(s.replyTo) != 2 || s.replyTo[0] != "q" || s.replyTo[1] != "q" || len(s.sentTimes) != 2 || len(p.saved) != 1 || !p.saved[0].Success || p.saved[0].DiscordMessageID != "reply-id" || !p.saved[0].CreatedAt.Equal(s.sentTimes[0]) || len(p.savedContent) != 1 || p.savedContent[0] != p.reply.Content {
+	if len(s.replies) != 2 || s.replies[0] != processingReplyText || len(s.replies[1]) > defaultReplyMaxChars || len(s.replyTo) != 2 || s.replyTo[0] != "q" || s.replyTo[1] != "q" || len(s.sentTimes) != 2 || len(s.editedContents) != 1 || len(s.editedContents[0]) > defaultReplyMaxChars || s.editedIDs[0] != "processing-id" || len(p.saved) != 1 || !p.saved[0].Success || p.saved[0].DiscordMessageID != "processing-id" || !p.saved[0].CreatedAt.Equal(s.sentTimes[0]) || len(p.savedContent) != 1 || p.savedContent[0] != p.reply.Content {
 		t.Fatalf("chunks=%d saved=%+v", len(s.replies), p.saved)
 	}
 	p.saved = nil

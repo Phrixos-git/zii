@@ -12,6 +12,7 @@ import (
 
 // Repository is the persistence boundary used by the Orchestrator.
 type Repository interface {
+	HasDiscordMessage(context.Context, string) (bool, error)
 	RecordUserMessage(context.Context, storage.UserMessage, time.Time) (string, error)
 	LoadMessagesBefore(context.Context, string, string) ([]storage.HistoryMessage, error)
 	RecordAssistantMessage(context.Context, storage.AssistantMessage) error
@@ -39,7 +40,8 @@ type Reply struct {
 	conversationID   string
 }
 
-// DiscordReplyResult is returned only after a successful Discord send.
+// DiscordReplyResult identifies the Processing Reply after the final answer
+// has been reflected successfully in Discord.
 type DiscordReplyResult struct {
 	RequestID        string
 	Success          bool
@@ -155,8 +157,27 @@ func (s *Service) ProcessQueued(ctx context.Context, queue *RequestQueue, reques
 // ProcessQueuedWith holds the conversation key until complete returns, so
 // reply delivery and assistant persistence remain ordered with later turns.
 func (s *Service) ProcessQueuedWith(ctx context.Context, queue *RequestQueue, request Request, complete func(context.Context, Reply) error) error {
+	return s.ProcessQueuedWithAccepted(ctx, queue, request, nil, complete)
+}
+
+// ProcessQueuedWithAccepted is like ProcessQueuedWith but forwards accepted to
+// the request queue, where it runs after enqueue and before Service.Process.
+func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQueue, request Request, accepted func(context.Context) error, complete func(context.Context, Reply) error) error {
+	if s == nil || s.repository == nil {
+		return errors.New("orchestrator: service is not initialized")
+	}
+	if ctx == nil {
+		return errors.New("orchestrator: context is nil")
+	}
 	if queue == nil {
 		return errors.New("orchestrator: request queue is nil")
+	}
+	duplicate, err := s.repository.HasDiscordMessage(ctx, request.DiscordMessageID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: check duplicate Discord message: %w", err)
+	}
+	if duplicate {
+		return storage.ErrDuplicateDiscordMessage
 	}
 	scopeID := request.ChannelID
 	if strings.TrimSpace(request.ThreadID) != "" {
@@ -167,7 +188,7 @@ func (s *Service) ProcessQueuedWith(ctx context.Context, queue *RequestQueue, re
 		guildID = *request.GuildID
 	}
 	key := fmt.Sprintf("%d:%s%d:%s%d:%s", len(guildID), guildID, len(scopeID), scopeID, len(request.UserID), request.UserID)
-	err := queue.Submit(ctx, key, func(workCtx context.Context) error {
+	err = queue.SubmitWithAccepted(ctx, key, accepted, func(workCtx context.Context) error {
 		workCtx = withRequestID(workCtx, request.RequestID)
 		reply, err := s.Process(workCtx, request)
 		if err != nil {
@@ -181,8 +202,9 @@ func (s *Service) ProcessQueuedWith(ctx context.Context, queue *RequestQueue, re
 	return err
 }
 
-// RecordSuccessfulReply persists the answer only after the adapter confirms a
-// successful Discord Reply and provides its message ID and creation time.
+// RecordSuccessfulReply persists the answer only after the adapter confirms
+// successful final-answer delivery and provides the representative message ID
+// and its creation time.
 func (s *Service) RecordSuccessfulReply(ctx context.Context, reply Reply, result DiscordReplyResult) error {
 	if s == nil || s.repository == nil {
 		return errors.New("orchestrator: service is not initialized")
