@@ -468,16 +468,35 @@ func splitMessage(text string, limit int) []string {
 	return out
 }
 
+// chooseSplitCut picks the cut index for an over-capacity chunk, preferring
+// the boundaries from the Discord design in this order: paragraph (a blank
+// line, i.e. consecutive newlines), newline, sentence end (Japanese and
+// ASCII period, exclamation, and question marks), word boundary (space), and
+// finally a hard cut at the rune capacity.
 func chooseSplitCut(runes []rune, capacity int) int {
 	if len(runes) <= capacity {
 		return len(runes)
 	}
 	end := capacity
-	for _, sep := range []rune{'\n', ' ', '。', '！', '？', '.', '!', '?'} {
-		for i := end - 1; i > 0; i-- {
-			if runes[i] == sep {
-				return i + 1
-			}
+	for i := end - 1; i >= 1; i-- {
+		if runes[i] == '\n' && runes[i-1] == '\n' {
+			return i + 1
+		}
+	}
+	for i := end - 1; i > 0; i-- {
+		if runes[i] == '\n' {
+			return i + 1
+		}
+	}
+	for i := end - 1; i > 0; i-- {
+		switch runes[i] {
+		case '。', '！', '？', '.', '!', '?':
+			return i + 1
+		}
+	}
+	for i := end - 1; i > 0; i-- {
+		if runes[i] == ' ' {
+			return i + 1
 		}
 	}
 	return end

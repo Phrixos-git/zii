@@ -162,6 +162,8 @@ func (s *Service) ProcessQueuedWith(ctx context.Context, queue *RequestQueue, re
 
 // ProcessQueuedWithAccepted is like ProcessQueuedWith but forwards accepted to
 // the request queue, where it runs after enqueue and before Service.Process.
+// The request is validated before the duplicate check and queue submission, so
+// accepted is not invoked for an invalid request.
 func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQueue, request Request, accepted func(context.Context) error, complete func(context.Context, Reply) error) error {
 	if s == nil || s.repository == nil {
 		return errors.New("orchestrator: service is not initialized")
@@ -171,6 +173,9 @@ func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQ
 	}
 	if queue == nil {
 		return errors.New("orchestrator: request queue is nil")
+	}
+	if err := validateRequest(request); err != nil {
+		return err
 	}
 	duplicate, err := s.repository.HasDiscordMessage(ctx, request.DiscordMessageID)
 	if err != nil {

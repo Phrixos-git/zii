@@ -156,6 +156,55 @@ func TestProcessQueuedWithAcceptedRejectsDuplicateBeforeAcceptance(t *testing.T)
 	}
 }
 
+func TestProcessQueuedWithAcceptedRejectsWhitespaceThreadIDBeforeAcceptance(t *testing.T) {
+	repo := &serviceRepo{conversationID: "c"}
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, err := NewService(repo, client, loop, ServiceConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := NewRequestQueue(QueueConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = queue.Shutdown(context.Background()) })
+	accepted := false
+	request := Request{RequestID: "r", DiscordMessageID: "unique", ChannelID: "ch", UserID: "u", ThreadID: "   ", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	err = service.ProcessQueuedWithAccepted(context.Background(), queue, request, func(context.Context) error {
+		accepted = true
+		return nil
+	}, nil)
+	if err == nil || accepted || repo.userCalls != 0 || len(client.requests) != 0 {
+		t.Fatalf("whitespace thread id err=%v accepted=%t userCalls=%d llmCalls=%d", err, accepted, repo.userCalls, len(client.requests))
+	}
+}
+
+func TestProcessQueuedWithAcceptedRejectsWhitespaceGuildIDBeforeAcceptance(t *testing.T) {
+	repo := &serviceRepo{conversationID: "c"}
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, err := NewService(repo, client, loop, ServiceConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := NewRequestQueue(QueueConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = queue.Shutdown(context.Background()) })
+	accepted := false
+	blankGuild := "   "
+	request := Request{RequestID: "r", DiscordMessageID: "unique", GuildID: &blankGuild, ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	err = service.ProcessQueuedWithAccepted(context.Background(), queue, request, func(context.Context) error {
+		accepted = true
+		return nil
+	}, nil)
+	if err == nil || accepted || repo.userCalls != 0 || len(client.requests) != 0 {
+		t.Fatalf("whitespace guild id err=%v accepted=%t userCalls=%d llmCalls=%d", err, accepted, repo.userCalls, len(client.requests))
+	}
+}
+
 func TestProcessQueuedWithAcceptedRunsBeforeOrchestrationAndStopsOnError(t *testing.T) {
 	for _, failAdmission := range []bool{false, true} {
 		repo := &serviceRepo{conversationID: "c"}

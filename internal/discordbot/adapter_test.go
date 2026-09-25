@@ -128,6 +128,45 @@ func TestHandleDoesNotReplyToDuplicateEvent(t *testing.T) {
 	}
 }
 
+type blockingProcessor struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingProcessor) ProcessQueuedWithAccepted(ctx context.Context, _ *orchestrator.RequestQueue, _ orchestrator.Request, accepted func(context.Context) error, _ func(context.Context, orchestrator.Reply) error) error {
+	if err := accepted(ctx); err != nil {
+		return err
+	}
+	close(p.entered)
+	<-p.release
+	return nil
+}
+
+func (p *blockingProcessor) RecordSuccessfulReply(context.Context, orchestrator.Reply, orchestrator.DiscordReplyResult) error {
+	return nil
+}
+
+func TestHandleIgnoresInFlightDuplicate(t *testing.T) {
+	p := &blockingProcessor{entered: make(chan struct{}), release: make(chan struct{})}
+	s := &senderFake{}
+	a, err := New(p, testQueue(t), s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		a.Handle(context.Background(), Incoming{ID: "in-flight", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+		close(done)
+	}()
+	<-p.entered
+	a.Handle(context.Background(), Incoming{ID: "in-flight", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText {
+		t.Fatalf("in-flight duplicate was handled: replies=%q", s.replies)
+	}
+	close(p.release)
+	<-done
+}
+
 func TestProcessingReplySendFailurePreventsProcessing(t *testing.T) {
 	p := &processorFake{}
 	s := &senderFake{errors: []error{statusRetryError{status: 403}}}
@@ -138,6 +177,43 @@ func TestProcessingReplySendFailurePreventsProcessing(t *testing.T) {
 	a.Handle(context.Background(), Incoming{ID: "receipt-fails", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
 	if p.processed != 0 || len(s.replies) != 0 || len(s.editedContents) != 0 || len(p.saved) != 0 {
 		t.Fatalf("receipt failure did not stop request: processed=%d replies=%q edits=%q saved=%v", p.processed, s.replies, s.editedContents, p.saved)
+	}
+}
+
+func TestHandleRetriesProcessingReplyAfterRetryableFailure(t *testing.T) {
+	p := &processorFake{}
+	s := &senderFake{errors: []error{statusRetryError{status: 503}}}
+	var waits []time.Duration
+	a, err := New(p, testQueue(t), s, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "retry-succeeds", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if p.processed != 1 || len(s.editedContents) != 1 || s.editedContents[0] != "answer" || len(p.saved) != 1 {
+		t.Fatalf("processing reply retry state: processed=%d edits=%q saved=%v", p.processed, s.editedContents, p.saved)
+	}
+	if s.calls != 2 || len(waits) != 1 || waits[0] != time.Second {
+		t.Fatalf("retry attempts=%d waits=%v; want 2 attempts and one 1s wait", s.calls, waits)
+	}
+}
+
+func TestHandleGivesUpOnProcessingReplyWhenAllRetriesFail(t *testing.T) {
+	p := &processorFake{}
+	s := &senderFake{errors: []error{statusRetryError{status: 503}, statusRetryError{status: 503}, statusRetryError{status: 503}, statusRetryError{status: 503}}}
+	var waits []time.Duration
+	a, err := New(p, testQueue(t), s, Config{Wait: func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(context.Background(), Incoming{ID: "retry-exhausted", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if p.processed != 0 || len(s.editedContents) != 0 || len(p.saved) != 0 || s.calls != 4 || len(waits) != 3 {
+		t.Fatalf("exhausted processing reply retries: processed=%d edits=%q saved=%v calls=%d waits=%v", p.processed, s.editedContents, p.saved, s.calls, waits)
 	}
 }
 
@@ -410,6 +486,46 @@ func TestDiscordEditUsesTheSameRetryPolicy(t *testing.T) {
 	}
 }
 
+func TestDiscordEditRetries5xxAndStopsOnPermanent4xx(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		editErrs  []error
+		wantErr   bool
+		wantCalls int
+		wantWaits []time.Duration
+	}{
+		{name: "503 then success", editErrs: []error{statusRetryError{status: 503}}, wantCalls: 2, wantWaits: []time.Duration{time.Second}},
+		{name: "403 not retried", editErrs: []error{statusRetryError{status: 403}}, wantErr: true, wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var waits []time.Duration
+			sender := &senderFake{editErrors: tc.editErrs}
+			adapter, err := New(&processorFake{}, testQueue(t), sender, Config{Wait: func(_ context.Context, delay time.Duration) error {
+				waits = append(waits, delay)
+				return nil
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = adapter.editWithRetry(context.Background(), "channel", "message", "answer")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("edit error=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if sender.editCalls != tc.wantCalls {
+				t.Fatalf("edit calls=%d, want %d", sender.editCalls, tc.wantCalls)
+			}
+			if len(waits) != len(tc.wantWaits) {
+				t.Fatalf("waits=%v, want %v", waits, tc.wantWaits)
+			}
+			for i := range tc.wantWaits {
+				if waits[i] != tc.wantWaits[i] {
+					t.Fatalf("retry delay[%d]=%s, want %s", i, waits[i], tc.wantWaits[i])
+				}
+			}
+		})
+	}
+}
+
 func testQueue(t *testing.T) *orchestrator.RequestQueue {
 	t.Helper()
 	q, err := orchestrator.NewRequestQueue(orchestrator.QueueConfig{})
@@ -496,6 +612,44 @@ func TestHandleDoesNotSendErrorReplyAfterCancellation(t *testing.T) {
 	a.Handle(ctx, Incoming{ID: "m", ChannelID: "c", UserID: "u", Content: "q", IsDM: true, CreatedAt: time.Now()}, "bot")
 	if len(s.replies) != 0 {
 		t.Fatalf("replies after cancellation = %v", s.replies)
+	}
+}
+
+type canceledAfterAcceptedProcessor struct {
+	cancel func()
+	saved  []orchestrator.DiscordReplyResult
+}
+
+func (p *canceledAfterAcceptedProcessor) ProcessQueuedWithAccepted(ctx context.Context, _ *orchestrator.RequestQueue, _ orchestrator.Request, accepted func(context.Context) error, _ func(context.Context, orchestrator.Reply) error) error {
+	if err := accepted(ctx); err != nil {
+		return err
+	}
+	p.cancel()
+	return context.Canceled
+}
+
+func (p *canceledAfterAcceptedProcessor) RecordSuccessfulReply(_ context.Context, _ orchestrator.Reply, r orchestrator.DiscordReplyResult) error {
+	p.saved = append(p.saved, r)
+	return nil
+}
+
+func TestHandleSkipsErrorEditAndSaveAfterContextCanceledPostProcessingReply(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &canceledAfterAcceptedProcessor{cancel: cancel}
+	s := &senderFake{}
+	a, err := New(p, testQueue(t), s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(ctx, Incoming{ID: "canceled-after-accepted", ChannelID: "dm", UserID: "u", Content: "question", IsDM: true, CreatedAt: time.Now()}, "bot")
+	if len(s.replies) != 1 || s.replies[0] != processingReplyText {
+		t.Fatalf("replies = %q, want exactly the one processing reply and no new error reply", s.replies)
+	}
+	if len(s.editedContents) != 0 {
+		t.Fatalf("error edits after cancellation = %q", s.editedContents)
+	}
+	if len(p.saved) != 0 {
+		t.Fatalf("assistant saved after cancellation = %+v", p.saved)
 	}
 }
 
@@ -611,5 +765,25 @@ func TestSplitMessageClosesAndReopensMarkdownCodeFences(t *testing.T) {
 		if strings.Count(part, "```")%2 != 0 {
 			t.Errorf("chunk %d leaves a Markdown code fence open: %q", i, part)
 		}
+	}
+}
+
+func TestChooseSplitCutBoundaryPriority(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		capacity int
+		want     int
+	}{
+		{name: "paragraph over later newline", text: "aa\n\nbbbb\ncccccccc", capacity: 10, want: 4},
+		{name: "newline over later sentence", text: "aa\nbbbb。cccc", capacity: 9, want: 3},
+		{name: "sentence over later space", text: "aa。bbbb cccc", capacity: 9, want: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := chooseSplitCut([]rune(tt.text), tt.capacity); got != tt.want {
+				t.Fatalf("chooseSplitCut(%q, %d) = %d, want %d", tt.text, tt.capacity, got, tt.want)
+			}
+		})
 	}
 }
