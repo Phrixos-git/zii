@@ -74,6 +74,8 @@ Duration values use Go duration syntax such as `30s`, `5m`, or `168h`. Numeric e
 
 Run from the repository root. The process writes structured JSON logs to standard output. Press Ctrl+C to request graceful shutdown; Zii stops accepting new requests, drains active work, and closes its connections and database.
 
+Discord request and delivery failures retain their existing `event` and `error_code` fields and add an `error_detail` object. It contains a redacted `message`, `type`, and `cause_type`, plus `http_status`, `discord_code`, `cause_code` (for example, SQLite code 5), or `context_error` when available. Use `request_id` to correlate failures with processing and final-answer events; `processing_message_id` on `request_failed` is empty if no receipt was recorded. Discord still receives only the generic error text. Configured sensitive values and recognized sensitive patterns are redacted, Discord API response bodies are omitted, and diagnostic messages are limited to 2048 characters plus a truncation marker.
+
 For development, run directly from source:
 
 ```sh

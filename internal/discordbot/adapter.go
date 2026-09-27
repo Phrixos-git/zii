@@ -177,7 +177,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 		}
 		sent, sendErr := a.sendWithRetry(workCtx, msg.ID, replyChannelID, processingReplyText)
 		if sendErr != nil {
-			slog.Warn("Discord processing reply failed", "component", "discord_bot", "event", "processing_reply_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "channel_id", replyChannelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "discord_send_failed")
+			slog.Warn("Discord processing reply failed", "component", "discord_bot", "event", "processing_reply_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "channel_id", replyChannelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "discord_send_failed", a.errorDetails(sendErr, msg.Content))
 			return fmt.Errorf("%w: processing reply failed", ErrReplyDelivery)
 		}
 		processingReply = sent
@@ -198,7 +198,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 			return fmt.Errorf("%w: final answer is empty", ErrReplyDelivery)
 		}
 		if editErr := a.editWithRetry(workCtx, replyChannelID, processingReply.ID, chunks[0]); editErr != nil {
-			slog.Error("Discord final reply edit failed", "component", "discord_bot", "event", "final_reply_edit_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "channel_id", replyChannelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "discord_edit_failed")
+			slog.Error("Discord final reply edit failed", "component", "discord_bot", "event", "final_reply_edit_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "channel_id", replyChannelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "discord_edit_failed", a.errorDetails(editErr, msg.Content, result.Content, chunks[0]))
 			_ = a.editProcessingError(workCtx, request.RequestID, msg.ID, replyChannelID, processingReply.ID, started)
 			return fmt.Errorf("%w: final reply edit failed", ErrReplyDelivery)
 		}
@@ -206,14 +206,14 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 		for i, chunk := range chunks[1:] {
 			sent, sendErr := a.sendWithRetry(workCtx, msg.ID, replyChannelID, chunk)
 			if sendErr != nil {
-				slog.Error("Discord final reply chunk failed", "component", "discord_bot", "event", "final_reply_chunk_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "channel_id", replyChannelID, "chunk_index", i+2, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "partial_reply")
-				slog.Error("Discord long reply was only partially delivered", "component", "discord_bot", "event", "partial_reply", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "channel_id", replyChannelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "partial_reply")
+				slog.Error("Discord final reply chunk failed", "component", "discord_bot", "event", "final_reply_chunk_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "channel_id", replyChannelID, "chunk_index", i+2, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "partial_reply", a.errorDetails(sendErr, msg.Content, result.Content, chunk))
+				slog.Error("Discord long reply was only partially delivered", "component", "discord_bot", "event", "partial_reply", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "channel_id", replyChannelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "partial_reply", a.errorDetails(sendErr, msg.Content, result.Content, chunk))
 				return fmt.Errorf("%w: send failed", ErrReplyDelivery)
 			}
 			slog.Info("Discord final reply chunk sent", "component", "discord_bot", "event", "final_reply_chunk_sent", "request_id", request.RequestID, "discord_message_id", msg.ID, "processing_message_id", processingReply.ID, "reply_message_id", sent.ID, "channel_id", replyChannelID, "chunk_index", i+2, "duration_ms", time.Since(started).Milliseconds(), "status", "success")
 		}
 		if persistErr := a.processor.RecordSuccessfulReply(workCtx, result, orchestrator.DiscordReplyResult{RequestID: result.RequestID, Success: true, DiscordMessageID: processingReply.ID, CreatedAt: processingReply.CreatedAt}); persistErr != nil {
-			slog.Error("Discord reply persistence failed", "component", "discord_bot", "event", "assistant_persist_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "storage_error")
+			slog.Error("Discord reply persistence failed", "component", "discord_bot", "event", "assistant_persist_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "storage_error", a.errorDetails(persistErr, msg.Content, result.Content))
 			return fmt.Errorf("%w: persistence failed", ErrReplyDelivery)
 		}
 		return nil
@@ -234,7 +234,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 		} else if errors.Is(err, orchestrator.ErrQueueWaitTimeout) {
 			code = "queue_timeout"
 		}
-		slog.Warn("Discord request failed", "component", "discord_bot", "event", "request_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "guild_id", msg.GuildID, "channel_id", msg.ChannelID, "user_id", msg.UserID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", code)
+		slog.Warn("Discord request failed", "component", "discord_bot", "event", "request_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "guild_id", msg.GuildID, "channel_id", msg.ChannelID, "user_id", msg.UserID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", code, "processing_message_id", processingReply.ID, a.errorDetails(err, msg.Content))
 		if ctx.Err() != nil {
 			return
 		}
@@ -242,7 +242,9 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 			_ = a.editProcessingError(ctx, request.RequestID, msg.ID, replyChannelID, processingReply.ID, started)
 			return
 		}
-		_ = a.sendChunks(ctx, msg.ID, replyChannelID, processingErrorText)
+		if sendErr := a.sendChunks(ctx, msg.ID, replyChannelID, processingErrorText); sendErr != nil {
+			slog.Error("Discord error reply failed", "component", "discord_bot", "event", "error_reply_failed", "request_id", request.RequestID, "discord_message_id", msg.ID, "channel_id", replyChannelID, "status", "failed", "error_code", "discord_send_failed", a.errorDetails(sendErr, msg.Content))
+		}
 		return
 	}
 	slog.Info("Discord request completed", "component", "discord_bot", "event", "request_completed", "request_id", request.RequestID, "discord_message_id", msg.ID, "guild_id", msg.GuildID, "channel_id", msg.ChannelID, "user_id", msg.UserID, "duration_ms", time.Since(started).Milliseconds(), "status", "success")
@@ -304,7 +306,7 @@ func (a *Adapter) editWithRetry(ctx context.Context, channelID, messageID, conte
 func (a *Adapter) editProcessingError(ctx context.Context, requestID, sourceMessageID, channelID, processingMessageID string, started time.Time) error {
 	err := a.editWithRetry(ctx, channelID, processingMessageID, processingErrorText)
 	if err != nil {
-		slog.Error("Discord processing error edit failed", "component", "discord_bot", "event", "final_reply_edit_failed", "request_id", requestID, "discord_message_id", sourceMessageID, "processing_message_id", processingMessageID, "channel_id", channelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "discord_edit_failed")
+		slog.Error("Discord processing error edit failed", "component", "discord_bot", "event", "final_reply_edit_failed", "request_id", requestID, "discord_message_id", sourceMessageID, "processing_message_id", processingMessageID, "channel_id", channelID, "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "discord_edit_failed", a.errorDetails(err))
 	}
 	return err
 }
