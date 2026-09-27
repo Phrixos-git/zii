@@ -969,10 +969,10 @@ contentが空でない
 ```
 
 - `finish_reason=length`は最終回答とみなさない。
-- 初回が`length`の場合は、**既に取得したTool Resultだけを圧縮**して1回だけ回答を再試行する。再試行のためにSearch MCPを呼び直したり、別のLLM要約を実行したりしない。
+- 初回が`length`の場合、または初回の`stop`本文にtool-call記法（`<tool_call>`、`function=...`、`parameter=...`）が含まれる場合は、**既に取得したTool Resultだけを圧縮**して1回だけ回答を再試行する。どちらの条件でも同じ再試行枠を使い、再試行のためにSearch MCPを呼び直したり、別のLLM要約を実行したりしない。
 - 圧縮ではTool Messageの対応関係を維持し、Tool Result全体を4,096 tokens以内に収める。収まらない結果は切り詰めたことを明示し、利用可能な証拠の範囲で結論を出す。
 - 再試行ではToolを無効にし、Requestに`tool_choice=none`を設定する。System指示で「調査結果から結論を直接回答する」こと、既存の証拠だけを使うこと、証拠が不足する場合はその旨を明示すること、tool呼び出し記法を本文へ出力しないことを指示する。
-- 再試行の`stop`本文に`<tool_call>`、`<function=...>`、`<parameter=...>`形式が含まれる場合は回答として扱わずエラーにする。
+- 再試行で`length`または`tool_calls`が返る場合、あるいは`stop`本文にtool-call記法が含まれる場合は、回答として扱わずエラーにする。
 - 再試行Requestだけに以下を設定する。
 
 ```text
@@ -982,7 +982,7 @@ max_tokens = 1536
 ```
 
 - 通常Requestは既定の`max_tokens=4096`を使い、`reasoning_effort`と`thinking_budget_tokens`を送らない。
-- 2回目も`length`なら、途中出力を正常回答として保存せずエラー扱い。
+- Discord AdapterはOrchestratorの検出を通過した後も、最終出力にtool-call記法が残っていないか送信・保存前に検査する。一致した場合は最終回答を配信・SQLite保存せず、既定のエラー応答にする。
 - Request Queueへの登録成功後、Discord AdapterはLLM処理前に元User MessageへのProcessing Replyを送る。送信に失敗した場合はOrchestrator処理を開始しない。
 - 最終回答確定後、Discord Adapterへ：
 

@@ -3,6 +3,8 @@ package discordbot
 import (
 	"regexp"
 	"strings"
+
+	"github.com/Phrixos-git/zii/internal/chat"
 )
 
 var sensitiveOutputPatterns = []struct {
@@ -19,7 +21,7 @@ var sensitiveOutputPatterns = []struct {
 	{name: "internal_endpoint", pattern: regexp.MustCompile(`(?i)\bhttps?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?::\d+)?(?:/[^\s"'<>]*)?`)},
 }
 
-// outputGuard blocks exact configured sensitive values and recognizable
+// outputGuard blocks tool-call syntax and configured or recognizable
 // credential, stack trace, local path, and private endpoint disclosures.
 type outputGuard struct{ blockedValues []string }
 
@@ -39,6 +41,9 @@ func (g outputGuard) reason(content string) string {
 		if strings.Contains(content, value) {
 			return "configured_sensitive_value"
 		}
+	}
+	if chat.ContainsToolCallMarkup(content) {
+		return "tool_call_syntax"
 	}
 	for _, detector := range sensitiveOutputPatterns {
 		if detector.pattern.MatchString(content) {

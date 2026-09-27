@@ -109,7 +109,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 	callCounts := make(map[string]int)
 	totalCalls := 0
 	toolsDisabled := false
-	shortenedRetryUsed := false
+	finalRetryUsed := false
 
 	for turn := 0; turn <= l.maxToolCalls+1; turn++ {
 		if err := ctx.Err(); err != nil {
@@ -127,7 +127,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		started := time.Now()
 		var completion llm.Completion
 		var err error
-		if shortenedRetryUsed {
+		if finalRetryUsed {
 			if client, ok := l.llm.(interface {
 				ChatWithOptions(context.Context, []chat.Message, []llm.ToolDefinition, llm.ChatOptions) (llm.Completion, error)
 			}); ok {
@@ -143,12 +143,12 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 		<-l.llmSlots
 		if err != nil {
 			slog.Warn("LLM request failed", "component", "orchestrator", "event", "llm_request_failed", "request_id", RequestIDFromContext(ctx), "duration_ms", time.Since(started).Milliseconds(), "status", "failed", "error_code", "llm_error")
-			if errors.Is(err, llm.ErrTruncated) && !shortenedRetryUsed {
+			if errors.Is(err, llm.ErrTruncated) && !finalRetryUsed {
 				messages, err = l.prepareTruncatedRetry(ctx, messages)
 				if err != nil {
 					return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
 				}
-				shortenedRetryUsed = true
+				finalRetryUsed = true
 				toolsDisabled = true
 				continue
 			}
@@ -167,23 +167,35 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			if answer == "" {
 				return "", errors.New("orchestrator: final answer is empty")
 			}
-			if shortenedRetryUsed && containsToolCallMarkup(answer) {
-				return "", errors.New("orchestrator: truncated-response retry returned tool-call markup instead of an answer")
+			if containsToolCallMarkup(answer) {
+				if finalRetryUsed {
+					return "", errors.New("orchestrator: final-answer retry returned tool-call markup instead of an answer")
+				}
+				messages, err = l.prepareToolMarkupRetry(ctx, messages)
+				if err != nil {
+					return "", fmt.Errorf("orchestrator: prepare tool-markup retry: %w", err)
+				}
+				finalRetryUsed = true
+				toolsDisabled = true
+				continue
 			}
 			return answer, nil
 		case "tool_calls":
+			if finalRetryUsed {
+				return "", errors.New("orchestrator: final-answer retry returned structured tool calls")
+			}
 			if completion.Message.Role != "assistant" || len(completion.Message.ToolCalls) != 1 {
 				return "", fmt.Errorf("orchestrator: expected one assistant tool call")
 			}
 		case "length":
-			if shortenedRetryUsed {
+			if finalRetryUsed {
 				return "", llm.ErrTruncated
 			}
 			messages, err = l.prepareTruncatedRetry(ctx, messages)
 			if err != nil {
 				return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
 			}
-			shortenedRetryUsed = true
+			finalRetryUsed = true
 			toolsDisabled = true
 			continue
 		default:
@@ -288,8 +300,7 @@ func prependConciseRetryInstruction(messages []chat.Message) []chat.Message {
 }
 
 func containsToolCallMarkup(answer string) bool {
-	answer = strings.ToLower(answer)
-	return strings.Contains(answer, "<tool_call>") || strings.Contains(answer, "<function=") || strings.Contains(answer, "<parameter=")
+	return chat.ContainsToolCallMarkup(answer)
 }
 
 func (l *ToolLoop) invoke(ctx context.Context, name string, arguments json.RawMessage) (searchmcp.ToolResult, error) {
