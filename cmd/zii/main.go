@@ -111,7 +111,8 @@ func run() error {
 		_ = db.Close()
 		return err
 	}
-	loop, err := orchestrator.NewToolLoopWithConfig(llmClient, searchClient, registry, orchestrator.ToolLoopConfig{MaxCalls: toolMax, SearchLocalMaxCalls: localMax, SearchWebMaxCalls: webMax, FetchPageMaxCalls: fetchMax, LLMMaxConcurrency: llmConcurrency, MCPMaxConcurrency: mcpConcurrency})
+	profile := llmClient.ModelProfile()
+	loop, err := orchestrator.NewToolLoopWithConfig(llmClient, searchClient, registry, orchestrator.ToolLoopConfig{MaxCalls: toolMax, SearchLocalMaxCalls: localMax, SearchWebMaxCalls: webMax, FetchPageMaxCalls: fetchMax, LLMMaxConcurrency: llmConcurrency, MCPMaxConcurrency: mcpConcurrency, Profile: &profile})
 	if err != nil {
 		_ = searchClient.Close()
 		_ = db.Close()

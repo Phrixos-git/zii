@@ -7,7 +7,7 @@ Zii is a Go Discord bot that stores per-user conversation history in SQLite, ask
 - Go 1.25 or newer to build or run from source.
 - A Discord application and bot token. Enable the `Guilds`, `Guild Messages`, and `Direct Messages` Gateway intents. Zii does not request the privileged Message Content intent.
 - Invite the bot with permission to view channels, send messages, send messages in threads, and read message history.
-- An OpenAI-compatible LLM server with the selected model loaded. The configured endpoint must support Chat Completions and tool calling. The default base URL is `http://127.0.0.1:8080`.
+- An OpenAI-compatible LLM server with the selected model loaded and a Chat Completions endpoint. The endpoint is configured by the selected Model Profile. Tool calling is used only when that profile enables the `tools` capability.
 - Search MCP serving Streamable HTTP and providing the tools Zii uses (`search_local`, `search_web`, and `fetch_page`). The default endpoint is `http://127.0.0.1:8081/mcp`.
 - A writable directory for the SQLite database. The database path must be absolute, and its parent directory must already exist.
 
@@ -27,7 +27,7 @@ Set these required values in `.env`:
 ```dotenv
 DISCORD_BOT_TOKEN=your-discord-bot-token
 BOT_DB_PATH=/absolute/path/to/zii/data/bot.db
-LLM_MODEL=model-id-reported-by-your-llm-server
+LLM_MODEL=qwen
 ```
 
 Create the database directory before starting Zii, for example:
@@ -36,7 +36,47 @@ Create the database directory before starting Zii, for example:
 mkdir -p /absolute/path/to/zii/data
 ```
 
-Change `LLM_BASE_URL` and `SEARCH_MCP_URL` in `.env` if the services use different addresses. `.env` is excluded from Git and is not loaded automatically by Zii. The commands below export its values into the current shell before launch. Do not commit or share `.env`; it contains the Discord bot token.
+Model IDs, LLM endpoints, capabilities, supported reasoning efforts, and generation defaults are configured in `config/model_profiles.yaml`. `LLM_MODEL` selects a key under `models:`; the profile's `model` value is sent to the API as the model name. Add or edit a profile there when changing the model or its endpoint. `.env` is excluded from Git and is not loaded automatically by Zii. The commands below export its values into the current shell before launch. Do not commit or share `.env`; it contains the Discord bot token. The legacy `LLM_BASE_URL` variable is ignored; the selected YAML profile endpoint is authoritative. If the legacy variable is set to a different endpoint, Zii logs a warning.
+
+`config/gpt-oss-20b.profile.example.yaml` shows how to add another profile. It is an example and is not loaded automatically. Its endpoint is a placeholder and must be replaced with the actual server address before selecting it. Profile effort and capability values must be checked against the target model/runtime.
+
+### Model Profiles and capabilities
+
+The active `config/model_profiles.yaml` contains the profiles Zii can select. A profile is keyed by its ID under `models:` and contains the API model name, endpoint, six capabilities, supported reasoning efforts, and default generation settings. For example:
+
+```yaml
+models:
+  qwen:
+    model: qwen
+    endpoint: http://127.0.0.1:8080
+    capabilities:
+      tools: true
+      reasoning: true
+      reasoning_content: true
+      reasoning_effort: true
+      thinking_budget: true
+      parallel_tool_calls: true
+    supported_reasoning_efforts:
+      - medium
+    defaults:
+      reasoning_effort: medium
+      thinking_budget_tokens: 2048
+```
+
+The Qwen profile currently shipped in the active file enables all six capabilities. Its supported effort list contains `medium`, the value verified against the configured Qwen endpoint. Add other effort values only after confirming that the model and serving runtime accept them.
+
+| Capability | Effect when enabled |
+| --- | --- |
+| `tools` | Sends Zii's Search MCP tool definitions and allows the existing tool-call flow. When disabled, tool definitions are omitted and tool execution is not started. |
+| `reasoning` | Allows reasoning-related request settings when their individual capabilities are also enabled. |
+| `reasoning_content` | Reads and keeps the API's `reasoning_content` separate from the user-facing answer content. |
+| `reasoning_effort` | Allows the configured reasoning effort to be sent. The value must be listed in `supported_reasoning_efforts`. |
+| `thinking_budget` | Allows `thinking_budget_tokens` to be sent. This is independent of `reasoning_effort`. |
+| `parallel_tool_calls` | Allows the request to accept multiple tool calls in one assistant response. Zii uses its existing tool-call handling; this setting does not add a parallel execution engine. |
+
+Capability flags control whether a feature or request field may be used; they do not supply its value. A reasoning field whose capability is disabled is omitted from the API request. An effort value that is not listed in `supported_reasoning_efforts` is rejected. Capability flags and other profile fields are validated at startup: invalid YAML, unknown fields, incomplete profiles, and an unknown `LLM_MODEL` cause startup to fail rather than being silently corrected.
+
+To add a model without changing or rebuilding Go code, copy the `gpt-oss-20b` entry from `config/gpt-oss-20b.profile.example.yaml` into the active file's `models:` mapping. Set its real endpoint and API model name, and confirm its capabilities, supported effort values, and defaults against that model/runtime. Then set `LLM_MODEL` to the profile key (for example, `gpt-oss-20b`) and restart Zii. To use another profile file, set `LLM_PROFILE_CONFIG`; relative paths are resolved from the process working directory.
 
 ### Environment settings
 
@@ -46,10 +86,12 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 | --- | --- | --- |
 | `DISCORD_BOT_TOKEN` | required | Discord bot token. |
 | `BOT_DB_PATH` | required | Absolute path to the SQLite database; the parent directory must be writable and exist. |
-| `LLM_MODEL` | required | Model identifier accepted by the LLM server. |
-| `LLM_BASE_URL` | `http://127.0.0.1:8080` | OpenAI-compatible API base URL. |
+| `LLM_MODEL` | required | Key of the selected model under `models:` in the profile YAML file. |
+| `LLM_PROFILE_CONFIG` | `config/model_profiles.yaml` | YAML file containing model profiles. Relative paths are resolved from the working directory. |
 | `LLM_TIMEOUT` | `180s` | Per-request LLM HTTP timeout. |
 | `LLM_MAX_TOKENS` | `4096` | Maximum tokens for a normal LLM request. |
+| `LLM_REASONING_EFFORT` | empty | Optional reasoning effort value, sent only when enabled by the model profile. |
+| `LLM_THINKING_BUDGET_TOKENS` | `0` | Optional positive token budget, sent only when enabled by the model profile. |
 | `LLM_MAX_CONCURRENCY` | `2` | Maximum concurrent LLM requests. |
 | `SEARCH_MCP_URL` | `http://127.0.0.1:8081/mcp` | Search MCP Streamable HTTP endpoint. |
 | `SEARCH_MCP_TIMEOUT` | `30s` | Search MCP request timeout. |
@@ -67,6 +109,8 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 | `DISCORD_REPLY_MAX_CHARS` | `1900` | Maximum characters per Discord reply chunk; must not exceed 2000. |
 | `DISCORD_SEND_MAX_RETRIES` | `3` | Maximum retry count for sending a reply. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error`. Unknown values use `info`. |
+
+`LLM_REASONING_EFFORT` and `LLM_THINKING_BUDGET_TOKENS` optionally override the selected profile's defaults. An effort value must appear in that profile's `supported_reasoning_efforts` list. A zero budget means “use the profile default”; set the YAML value to `null` for no default budget. Each value is sent only when both `reasoning` and its corresponding `reasoning_effort` or `thinking_budget` capability are enabled. A disabled capability causes the field to be omitted even when an environment override or profile default is present.
 
 Duration values use Go duration syntax such as `30s`, `5m`, or `168h`. Numeric environment limits must be positive integers. `DISCORD_SEND_MAX_RETRIES` accepts values from `1` through `10`.
 

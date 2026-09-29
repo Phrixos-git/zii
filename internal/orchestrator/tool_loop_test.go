@@ -136,6 +136,50 @@ func TestToolLoopReturnsFinalAnswerAndKeepsToolMessagesRequestLocal(t *testing.T
 	}
 }
 
+func TestToolLoopHandlesMultipleCallsSequentiallyWhenProfileAllowsThem(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{responses: []llm.Completion{
+		{FinishReason: "tool_calls", Message: chat.Message{Role: "assistant", ToolCalls: []chat.ToolCall{
+			{ID: "web", Type: "function", Function: chat.FunctionCall{Name: "search_web", Arguments: json.RawMessage(`{"query":"web"}`)}},
+			{ID: "local", Type: "function", Function: chat.FunctionCall{Name: "search_local", Arguments: json.RawMessage(`{"query":"local"}`)}},
+		}}},
+		{FinishReason: "stop", Message: chat.Message{Role: "assistant", Content: "combined"}},
+	}}
+	search := &fakeLoopSearch{results: []searchmcp.ToolResult{{Data: json.RawMessage(`{"web":true}`)}, {Data: json.RawMessage(`{"local":true}`)}}}
+	profile := llm.ModelProfile{ID: "parallel-test", Capabilities: llm.Capabilities{Tools: true, ParallelToolCalls: true}}
+	loop, err := NewToolLoopWithConfig(fakeLLM, search, newTestRegistry(t), ToolLoopConfig{MaxCalls: 7, SearchLocalMaxCalls: 2, SearchWebMaxCalls: 2, FetchPageMaxCalls: 3, Profile: &profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop.mcpRetryDelay = 0
+	answer, err := loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "q"}})
+	if err != nil || answer != "combined" {
+		t.Fatalf("Run = %q, %v", answer, err)
+	}
+	if len(search.calls) != 2 || search.calls[0] != "search_web" || search.calls[1] != "search_local" {
+		t.Fatalf("Search MCP call order = %v", search.calls)
+	}
+	if len(fakeLLM.requests) != 2 || len(fakeLLM.requests[1]) != 4 || len(fakeLLM.requests[1][1].ToolCalls) != 2 || fakeLLM.requests[1][2].ToolCallID != "web" || fakeLLM.requests[1][3].ToolCallID != "local" {
+		t.Fatalf("multiple tool exchange not preserved: %+v", fakeLLM.requests)
+	}
+}
+
+func TestToolLoopDoesNotOfferToolsWhenProfileDisablesThem(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{responses: []llm.Completion{fakeToolCall("call", "search_web", `{"query":"q"}`)}}
+	search := &fakeLoopSearch{}
+	profile := llm.ModelProfile{ID: "no-tools"}
+	loop, err := NewToolLoopWithConfig(fakeLLM, search, newTestRegistry(t), ToolLoopConfig{MaxCalls: 7, SearchLocalMaxCalls: 2, SearchWebMaxCalls: 2, FetchPageMaxCalls: 3, Profile: &profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "q"}})
+	if err == nil || !strings.Contains(err.Error(), "does not allow tools") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(fakeLLM.definitions) != 1 || len(fakeLLM.definitions[0]) != 0 || len(search.calls) != 0 {
+		t.Fatalf("tools were exposed or executed: defs=%v calls=%v", fakeLLM.definitions, search.calls)
+	}
+}
+
 func TestToolLoopRejectsInvalidSchemaBeforeMCPAndAllowsSelfCorrection(t *testing.T) {
 	fakeLLM := &fakeLoopLLM{responses: []llm.Completion{
 		fakeToolCall("bad", "search_local", `{"query":2}`),

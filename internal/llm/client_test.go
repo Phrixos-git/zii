@@ -20,12 +20,152 @@ import (
 
 func newTestClient(t *testing.T, server *httptest.Server) *Client {
 	t.Helper()
-	client, err := NewClient(Config{BaseURL: server.URL, Model: "test-model", HTTPClient: server.Client()})
+	profile := ModelProfile{ID: "test", Model: "test-model", Endpoint: server.URL, Capabilities: Capabilities{Tools: true, Reasoning: true, ReasoningContent: true}}
+	client, err := NewClient(Config{Profile: profile, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 	client.retryDelay = 0
 	return client
+}
+
+func TestChatRequestIncludesEnabledCapabilitySettings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]string{"tools": "[", "reasoning_effort": `"high"`, "thinking_budget_tokens": "2048", "parallel_tool_calls": "true"} {
+			value, ok := got[key]
+			if !ok || !strings.HasPrefix(string(value), want) {
+				t.Errorf("%s = %s, want prefix %s", key, value, want)
+			}
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+	budgetDefault := 1024
+	profile := ModelProfile{ID: "all", Model: "custom", Endpoint: server.URL, Capabilities: Capabilities{Tools: true, Reasoning: true, ReasoningContent: true, ReasoningEffort: true, ThinkingBudget: true, ParallelToolCalls: true}, SupportedReasoningEfforts: []string{"medium", "high"}, Defaults: ModelDefaults{ReasoningEffort: "medium", ThinkingBudgetTokens: &budgetDefault}}
+	client, err := NewClient(Config{Profile: profile, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ChatWithOptions(context.Background(), []chat.Message{{Role: "user", Content: "q"}}, []ToolDefinition{{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}}, ChatOptions{ReasoningEffort: "high", ThinkingBudgetTokens: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChatUsesProfileGenerationDefaults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if string(got["reasoning_effort"]) != `"medium"` || string(got["thinking_budget_tokens"]) != "2048" {
+			t.Errorf("profile generation defaults = effort %s, budget %s", got["reasoning_effort"], got["thinking_budget_tokens"])
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+	budget := 2048
+	profile := ModelProfile{ID: "profile-defaults", Model: "model", Endpoint: server.URL, Capabilities: Capabilities{Reasoning: true, ReasoningEffort: true, ThinkingBudget: true}, SupportedReasoningEfforts: []string{"medium"}, Defaults: ModelDefaults{ReasoningEffort: "medium", ThinkingBudgetTokens: &budget}}
+	client, err := NewClient(Config{Profile: profile, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Chat(context.Background(), []chat.Message{{Role: "user", Content: "q"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChatRequestOmitsDisabledCapabilities(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"tools", "tool_choice", "parallel_tool_calls", "reasoning_effort", "thinking_budget_tokens"} {
+			if _, ok := got[key]; ok {
+				t.Errorf("request unexpectedly contains %s", key)
+			}
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+	profile := ModelProfile{ID: "none", Model: "custom", Endpoint: server.URL, Capabilities: Capabilities{}}
+	client, err := NewClient(Config{Profile: profile, ReasoningEffort: "medium", ThinkingBudgetTokens: 2048, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Chat(context.Background(), []chat.Message{{Role: "user", Content: "q"}}, []ToolDefinition{{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChatOmitsReasoningSettingsWhenIndividualCapabilitiesAreDisabled(t *testing.T) {
+	cases := []struct {
+		name string
+		caps Capabilities
+	}{
+		{name: "reasoning effort", caps: Capabilities{Reasoning: true, ThinkingBudget: true}},
+		{name: "thinking budget", caps: Capabilities{Reasoning: true, ReasoningEffort: true}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var got map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Fatal(err)
+				}
+				key := "reasoning_effort"
+				if tt.name == "thinking budget" {
+					key = "thinking_budget_tokens"
+				}
+				if _, ok := got[key]; ok {
+					t.Errorf("request unexpectedly contains %s", key)
+				}
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+			}))
+			defer server.Close()
+			profile := ModelProfile{ID: "partial", Model: "custom", Endpoint: server.URL, Capabilities: tt.caps}
+			if tt.caps.ReasoningEffort {
+				profile.SupportedReasoningEfforts = []string{"medium"}
+				profile.Defaults.ReasoningEffort = "medium"
+			}
+			client, err := NewClient(Config{Profile: profile, ReasoningEffort: "medium", ThinkingBudgetTokens: 2048, HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Chat(context.Background(), []chat.Message{{Role: "user", Content: "q"}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestChatPreservesReasoningContentToolCallsAndUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"answer","reasoning_content":"private thoughts","tool_calls":[{"id":"c","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"lookup","arguments":{"id":2}}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`)
+	}))
+	defer server.Close()
+	profile := ModelProfile{ID: "all", Model: "custom", Endpoint: server.URL, Capabilities: Capabilities{Tools: true, ReasoningContent: true, ParallelToolCalls: true}}
+	client, err := NewClient(Config{Profile: profile, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.Chat(context.Background(), []chat.Message{{Role: "user", Content: "q"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Message.Role != "assistant" || got.Message.Content != "answer" || got.Message.ReasoningContent != "private thoughts" || len(got.Message.ToolCalls) != 2 || got.Usage.TotalTokens != 7 {
+		t.Fatalf("completion = %+v", got)
+	}
+	if string(got.Message.ToolCalls[1].Function.Arguments) != `{"id":2}` {
+		t.Fatalf("second call arguments = %s", got.Message.ToolCalls[1].Function.Arguments)
+	}
 }
 
 func TestChatUsesOpenAIRequestDefaultsAndParsesFinalAnswer(t *testing.T) {
@@ -137,7 +277,7 @@ func TestChatClassifiesFinishReasonsAndInvalidArguments(t *testing.T) {
 
 func TestTransportDoesNotRetryTimeout(t *testing.T) {
 	transport := &timeoutRoundTripper{}
-	client, err := NewClient(Config{BaseURL: "http://example.test", Model: "test-model", Timeout: time.Second, HTTPClient: &http.Client{Transport: transport}})
+	client, err := NewClient(Config{Profile: ModelProfile{ID: "test", Model: "test-model", Endpoint: "http://example.test"}, Timeout: time.Second, HTTPClient: &http.Client{Transport: transport}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,8 +395,7 @@ func (rt *retryRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 func TestTransportRetriesNetworkErrorOnce(t *testing.T) {
 	roundTripper := &retryRoundTripper{}
 	client, err := NewClient(Config{
-		BaseURL:    "http://example.test",
-		Model:      "test-model",
+		Profile:    ModelProfile{ID: "test", Model: "test-model", Endpoint: "http://example.test"},
 		HTTPClient: &http.Client{Transport: roundTripper},
 	})
 	if err != nil {

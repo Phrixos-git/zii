@@ -1,0 +1,18 @@
+models:
+  qwen:
+    model: qwen
+    endpoint: http://127.0.0.1:8080
+    capabilities:
+      tools: true
+      reasoning: true
+      reasoning_content: true
+      reasoning_effort: true
+      thinking_budget: true
+      parallel_tool_calls: true
+    # The live Qwen endpoint was verified with medium. Add other values only
+    # after confirming that the selected model/template accepts them.
+    supported_reasoning_efforts:
+      - medium
+    defaults:
+      reasoning_effort: medium
+      thinking_budget_tokens: 2048
