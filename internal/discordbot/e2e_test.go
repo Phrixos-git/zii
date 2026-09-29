@@ -80,7 +80,7 @@ func TestDiscordSQLiteEndToEndLongReplyAndDuplicateEvent(t *testing.T) {
 		t.Fatalf("NewRequestQueue: %v", err)
 	}
 	t.Cleanup(func() { _ = queue.Shutdown(context.Background()) })
-	sender := &senderFake{createdAt: replyAt}
+	sender := &senderFake{createdAt: replyAt, replyIDs: []string{"processing-reply-id", "extra-chunk-id"}}
 	adapter, err := New(service, queue, sender, Config{Clock: func() time.Time { return fixedNow }, RequestIDGenerator: func() string { return "e2e-request" }})
 	if err != nil {
 		t.Fatalf("New Adapter: %v", err)
@@ -88,8 +88,8 @@ func TestDiscordSQLiteEndToEndLongReplyAndDuplicateEvent(t *testing.T) {
 	messageCreatedAt := fixedNow.Add(-time.Hour)
 	incoming := Incoming{ID: "discord-question", ChannelID: "dm-channel", UserID: "user", Content: "answer at length", CreatedAt: messageCreatedAt, IsDM: true}
 	adapter.Handle(ctx, incoming, "bot")
-	if sender.calls != 2 || len(sender.replies) != 2 || len(sender.replyTo) != 2 || sender.replyTo[0] != incoming.ID || sender.replyTo[1] != incoming.ID {
-		t.Fatalf("Discord sends=%d reply targets=%v; want 2 replies to source message", sender.calls, sender.replyTo)
+	if sender.calls != 2 || len(sender.replies) != 2 || sender.replies[0] != processingReplyText || len(sender.replyTo) != 2 || sender.replyTo[0] != incoming.ID || sender.replyTo[1] != incoming.ID || len(sender.editedContents) != 1 || sender.editedIDs[0] != "processing-reply-id" || sender.editedContents[0] != splitMessage(answer, defaultReplyMaxChars)[0] {
+		t.Fatalf("Discord sends=%d reply targets=%v edits=%q edit IDs=%v", sender.calls, sender.replyTo, sender.editedContents, sender.editedIDs)
 	}
 	if len(chatClient.requests) != 1 || chatClient.requests[0][0].Role != "system" || chatClient.requests[0][len(chatClient.requests[0])-1].Role != "user" {
 		t.Fatalf("LLM request context roles are incorrect: %+v", chatClient.requests)
@@ -118,7 +118,7 @@ func TestDiscordSQLiteEndToEndLongReplyAndDuplicateEvent(t *testing.T) {
 	if len(got) != 2 || got[0].role != "user" || got[0].discordID != incoming.ID || got[0].content != incoming.Content || got[0].createdAt != messageCreatedAt.UTC().Format("2006-01-02T15:04:05.000000000Z") {
 		t.Fatalf("stored user message = %+v", got)
 	}
-	if got[1].role != "assistant" || got[1].discordID != "reply-id" || got[1].content != answer || got[1].createdAt != replyAt.Format("2006-01-02T15:04:05.000000000Z") {
+	if got[1].role != "assistant" || got[1].discordID != "processing-reply-id" || got[1].content != answer || got[1].createdAt != replyAt.Format("2006-01-02T15:04:05.000000000Z") {
 		t.Fatalf("stored assistant message = %+v", got[1])
 	}
 	var lastActive string
@@ -134,7 +134,7 @@ func TestDiscordSQLiteEndToEndLongReplyAndDuplicateEvent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&messageCount); err != nil {
 		t.Fatal(err)
 	}
-	if messageCount != 2 || sender.calls != 2 || len(chatClient.requests) != 1 {
-		t.Fatalf("duplicate event caused side effects: messages=%d sends=%d LLM calls=%d", messageCount, sender.calls, len(chatClient.requests))
+	if messageCount != 2 || sender.calls != 2 || sender.editCalls != 1 || len(chatClient.requests) != 1 {
+		t.Fatalf("duplicate event caused side effects: messages=%d sends=%d edits=%d LLM calls=%d", messageCount, sender.calls, sender.editCalls, len(chatClient.requests))
 	}
 }

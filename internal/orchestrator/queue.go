@@ -21,9 +21,11 @@ const (
 
 type queuedRequest struct {
 	ctx        context.Context
+	cancel     context.CancelFunc
 	key        string
 	enqueuedAt time.Time
 	started    chan struct{}
+	ready      bool
 	work       func(context.Context) error
 	result     chan error
 }
@@ -70,6 +72,14 @@ func NewRequestQueue(cfg QueueConfig) (*RequestQueue, error) {
 }
 
 func (q *RequestQueue) Submit(ctx context.Context, conversationKey string, work func(context.Context) error) error {
+	return q.SubmitWithAccepted(ctx, conversationKey, nil, work)
+}
+
+// SubmitWithAccepted reserves a queue slot before calling accepted. The
+// callback runs outside the queue lock and must succeed before the work can be
+// dispatched. This lets callers acknowledge an accepted request without
+// allowing its processing to start first.
+func (q *RequestQueue) SubmitWithAccepted(ctx context.Context, conversationKey string, accepted func(context.Context) error, work func(context.Context) error) error {
 	if q == nil || ctx == nil || work == nil || conversationKey == "" {
 		return errors.New("orchestrator: invalid queued request")
 	}
@@ -83,18 +93,91 @@ func (q *RequestQueue) Submit(ctx context.Context, conversationKey string, work 
 		return ErrBusy
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, q.requestTimeout)
-	defer cancel()
-	job := &queuedRequest{ctx: requestCtx, key: conversationKey, enqueuedAt: time.Now(), started: make(chan struct{}), work: work, result: make(chan error, 1)}
+	job := &queuedRequest{ctx: requestCtx, cancel: cancel, key: conversationKey, started: make(chan struct{}), work: work, result: make(chan error, 1)}
 	q.queue = append(q.queue, job)
+	q.mu.Unlock()
+
+	if accepted != nil {
+		if err := accepted(requestCtx); err != nil {
+			q.mu.Lock()
+			removed := false
+			for i, queued := range q.queue {
+				if queued == job {
+					q.queue = append(q.queue[:i], q.queue[i+1:]...)
+					removed = true
+					break
+				}
+			}
+			closed := q.closed
+			q.mu.Unlock()
+			cancel()
+			if removed {
+				q.signal()
+				return err
+			}
+			if closed {
+				return ErrQueueClosed
+			}
+			select {
+			case resultErr := <-job.result:
+				return resultErr
+			default:
+				return err
+			}
+		}
+	}
+
+	q.mu.Lock()
+	queued := false
+	for _, candidate := range q.queue {
+		if candidate == job {
+			queued = true
+			break
+		}
+	}
+	if !queued || q.closed {
+		closed := q.closed
+		q.mu.Unlock()
+		cancel()
+		if closed {
+			return ErrQueueClosed
+		}
+		select {
+		case err := <-job.result:
+			return err
+		default:
+			return requestCtx.Err()
+		}
+	}
+	if err := requestCtx.Err(); err != nil {
+		for i, candidate := range q.queue {
+			if candidate == job {
+				q.queue = append(q.queue[:i], q.queue[i+1:]...)
+				break
+			}
+		}
+		q.mu.Unlock()
+		cancel()
+		q.signal()
+		return err
+	}
+	job.enqueuedAt = time.Now()
+	job.ready = true
 	q.mu.Unlock()
 	q.signal()
 	timer := time.NewTimer(q.queueWait)
 	defer timer.Stop()
+	defer cancel()
 	select {
 	case err := <-job.result:
 		return err
 	case <-requestCtx.Done():
-		return requestCtx.Err()
+		select {
+		case err := <-job.result:
+			return err
+		default:
+			return requestCtx.Err()
+		}
 	case <-timer.C:
 		select {
 		case <-job.started:
@@ -128,13 +211,14 @@ func (q *RequestQueue) dispatch() {
 		q.mu.Lock()
 		for i := 0; i < len(q.queue); {
 			job := q.queue[i]
-			if job.ctx.Err() != nil || time.Since(job.enqueuedAt) >= q.queueWait {
+			if job.ready && (job.ctx.Err() != nil || time.Since(job.enqueuedAt) >= q.queueWait) {
 				q.queue = append(q.queue[:i], q.queue[i+1:]...)
 				if job.ctx.Err() != nil {
 					job.result <- job.ctx.Err()
 				} else {
 					job.result <- ErrQueueWaitTimeout
 				}
+				job.cancel()
 				continue
 			}
 			i++
@@ -142,9 +226,11 @@ func (q *RequestQueue) dispatch() {
 		for running < q.maxRunning {
 			idx := -1
 			for i, job := range q.queue {
-				if _, busy := q.active[job.key]; !busy {
-					idx = i
-					break
+				if job.ready {
+					if _, busy := q.active[job.key]; !busy {
+						idx = i
+						break
+					}
 				}
 			}
 			if idx < 0 {
@@ -195,6 +281,7 @@ func (q *RequestQueue) Shutdown(ctx context.Context) error {
 	q.closed = true
 	for _, job := range q.queue {
 		job.result <- ErrQueueClosed
+		job.cancel()
 	}
 	q.queue = nil
 	q.mu.Unlock()

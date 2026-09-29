@@ -38,6 +38,31 @@ func countMessages(previous []chat.Message, content string) []chat.Message {
 	return messages
 }
 
+func countMarkerTokens(ctx context.Context, counter TokenCounter) (int, error) {
+	marker, err := counter.CountTokens(ctx, []chat.Message{{Role: "user", Content: tokenCountUserMarker}})
+	if err != nil {
+		return 0, err
+	}
+	if marker < 0 {
+		return 0, errors.New("orchestrator: token counter returned a negative marker count")
+	}
+	return marker, nil
+}
+
+// countToolContentTokens returns the token count of the candidate tool
+// content with the fixed user marker excluded. The caller measures the marker
+// once per high-level fit operation and reuses it for all binary-search probes.
+func countToolContentTokens(ctx context.Context, counter TokenCounter, markerTokens int, previous []chat.Message, content string) (int, error) {
+	full, err := counter.CountTokens(ctx, countMessages(previous, content))
+	if err != nil {
+		return 0, err
+	}
+	if full < 0 || markerTokens < 0 || full-markerTokens < 0 {
+		return 0, errors.New("orchestrator: token counter returned a negative or inconsistent count")
+	}
+	return full - markerTokens, nil
+}
+
 type toolResultBudget struct {
 	counter TokenCounter
 }
@@ -45,6 +70,10 @@ type toolResultBudget struct {
 func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []chat.Message, result []byte) (string, bool, bool, error) {
 	if b.counter == nil {
 		return "", false, false, errors.New("orchestrator: tool result token counter is nil")
+	}
+	markerTokens, err := countMarkerTokens(ctx, b.counter)
+	if err != nil {
+		return "", false, false, fmt.Errorf("orchestrator: count tool result marker: %w", err)
 	}
 	if !utf8.Valid(result) {
 		result = []byte(strings.ToValidUTF8(string(result), "�"))
@@ -59,7 +88,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 	full := string(result)
 	page := toolName == "fetch_page"
 	if !forceTruncation {
-		fits, err := b.fits(ctx, previous, full, page)
+		fits, err := b.fits(ctx, markerTokens, previous, full, page)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -77,7 +106,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 		if err != nil {
 			return "", false, false, fmt.Errorf("orchestrator: encode truncated tool result: %w", err)
 		}
-		fits, err := b.fits(ctx, previous, candidate, page)
+		fits, err := b.fits(ctx, markerTokens, previous, candidate, page)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -91,35 +120,26 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 	if best == "" {
 		return "", false, true, errToolContextFull
 	}
-	used, err := b.counter.CountTokens(ctx, countMessages(previous, best))
+	used, err := countToolContentTokens(ctx, b.counter, markerTokens, previous, best)
 	if err != nil {
 		return "", false, false, fmt.Errorf("orchestrator: count truncated tool context: %w", err)
-	}
-	if used < 0 {
-		return "", false, false, errors.New("orchestrator: token counter returned a negative truncated context count")
 	}
 	fullBudget := used >= maxToolContextTokens-toolBudgetReserve-32
 	return best, true, fullBudget, nil
 }
 
-func (b toolResultBudget) fits(ctx context.Context, previous []chat.Message, content string, page bool) (bool, error) {
-	totalTokens, err := b.counter.CountTokens(ctx, countMessages(previous, content))
+func (b toolResultBudget) fits(ctx context.Context, markerTokens int, previous []chat.Message, content string, page bool) (bool, error) {
+	totalTokens, err := countToolContentTokens(ctx, b.counter, markerTokens, previous, content)
 	if err != nil {
 		return false, fmt.Errorf("orchestrator: count tool result context: %w", err)
-	}
-	if totalTokens < 0 {
-		return false, errors.New("orchestrator: token counter returned a negative tool context count")
 	}
 	if totalTokens > maxToolContextTokens-toolBudgetReserve {
 		return false, nil
 	}
 	if page {
-		pageTokens, err := b.counter.CountTokens(ctx, countMessages(nil, content))
+		pageTokens, err := countToolContentTokens(ctx, b.counter, markerTokens, nil, content)
 		if err != nil {
 			return false, fmt.Errorf("orchestrator: count fetch_page result: %w", err)
-		}
-		if pageTokens < 0 {
-			return false, errors.New("orchestrator: token counter returned a negative fetch_page count")
 		}
 		if pageTokens > maxFetchPageTokens {
 			return false, nil
@@ -154,6 +174,10 @@ func compactToolResults(ctx context.Context, counter TokenCounter, messages []ch
 	if toolCount == 0 {
 		return compacted, nil
 	}
+	markerTokens, err := countMarkerTokens(ctx, counter)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: count retry tool result marker: %w", err)
+	}
 
 	previous := make([]chat.Message, 0, toolCount)
 	seen := 0
@@ -163,7 +187,7 @@ func compactToolResults(ctx context.Context, counter TokenCounter, messages []ch
 		}
 		seen++
 		targetTokens := maxRetryToolTokens * seen / toolCount
-		content, err := fitRetryToolResult(ctx, counter, previous, compacted[i].Content, targetTokens)
+		content, err := fitRetryToolResult(ctx, counter, markerTokens, previous, compacted[i].Content, targetTokens)
 		if err != nil {
 			return nil, err
 		}
@@ -173,14 +197,11 @@ func compactToolResults(ctx context.Context, counter TokenCounter, messages []ch
 	return compacted, nil
 }
 
-func fitRetryToolResult(ctx context.Context, counter TokenCounter, previous []chat.Message, content string, targetTokens int) (string, error) {
+func fitRetryToolResult(ctx context.Context, counter TokenCounter, markerTokens int, previous []chat.Message, content string, targetTokens int) (string, error) {
 	count := func(candidate string) (int, error) {
-		tokens, err := counter.CountTokens(ctx, countMessages(previous, candidate))
+		tokens, err := countToolContentTokens(ctx, counter, markerTokens, previous, candidate)
 		if err != nil {
 			return 0, fmt.Errorf("orchestrator: count retry tool result: %w", err)
-		}
-		if tokens < 0 {
-			return 0, errors.New("orchestrator: token counter returned a negative retry token count")
 		}
 		return tokens, nil
 	}

@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// AssistantMessage contains the final answer and the representative Discord
-// message returned after a successful reply send.
+// AssistantMessage contains the final answer and the representative Processing
+// Reply after the final answer is reflected successfully in Discord.
 type AssistantMessage struct {
 	ConversationID   string
 	DiscordMessageID string
@@ -19,8 +19,8 @@ type AssistantMessage struct {
 	MessageCreatedAt time.Time
 }
 
-// RecordAssistantMessage saves a successfully sent assistant reply. It does
-// not refresh the conversation's user-activity timestamp.
+// RecordAssistantMessage saves a successfully delivered assistant answer. It
+// does not refresh the conversation's user-activity timestamp.
 func (r *Repository) RecordAssistantMessage(ctx context.Context, in AssistantMessage) error {
 	if r == nil || r.db == nil {
 		return errors.New("storage: repository is nil")

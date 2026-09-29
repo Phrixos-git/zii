@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +95,123 @@ func TestRequestQueueReturnsBusyAtCapacity(t *testing.T) {
 	close(release)
 	if err := <-queued; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSubmitWithAcceptedRunsAfterQueueInsertionAndBeforeWork(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 1, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Shutdown(context.Background())
+	workStarted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- q.SubmitWithAccepted(context.Background(), "accepted", func(ctx context.Context) error {
+			// The current job already occupies the only queue slot, and the
+			// callback can acquire q.mu because it runs outside that lock.
+			if err := q.Submit(ctx, "other", func(context.Context) error { return nil }); !errors.Is(err, ErrBusy) {
+				return fmt.Errorf("nested submit error = %v, want ErrBusy", err)
+			}
+			return nil
+		}, func(context.Context) error { close(workStarted); return nil })
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission callback blocked on queue mutex")
+	}
+	select {
+	case <-workStarted:
+	default:
+		t.Fatal("work did not start after successful acceptance callback")
+	}
+}
+
+func TestSubmitWithAcceptedFailureSkipsWorkAndReleasesQueueSlot(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 1, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Shutdown(context.Background())
+	acceptErr := errors.New("acknowledgement failed")
+	workRan := false
+	err = q.SubmitWithAccepted(context.Background(), "same", func(context.Context) error { return acceptErr }, func(context.Context) error {
+		workRan = true
+		return nil
+	})
+	if !errors.Is(err, acceptErr) || workRan {
+		t.Fatalf("submit error=%v workRan=%t", err, workRan)
+	}
+	if err := q.Submit(context.Background(), "same", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("queue slot/key was not released after admission failure: %v", err)
+	}
+}
+
+func TestSubmitWithAcceptedDoesNotRunCallbackWhenQueueIsFull(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 1, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Shutdown(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		first <- q.Submit(context.Background(), "active", func(context.Context) error { close(started); <-release; return nil })
+	}()
+	<-started
+	queued := make(chan error, 1)
+	go func() {
+		queued <- q.Submit(context.Background(), "queued", func(context.Context) error { return nil })
+	}()
+	time.Sleep(20 * time.Millisecond)
+	called := false
+	if err := q.SubmitWithAccepted(context.Background(), "full", func(context.Context) error { called = true; return nil }, func(context.Context) error { return nil }); !errors.Is(err, ErrBusy) {
+		t.Fatalf("full queue error = %v, want ErrBusy", err)
+	}
+	if called {
+		t.Fatal("acceptance callback ran for a request rejected by the full queue")
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-queued; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShutdownCancelsAnAdmissionCallbackWithoutStartingWork(t *testing.T) {
+	q, err := NewRequestQueue(QueueConfig{MaxQueued: 1, MaxRunning: 1, QueueWait: time.Second, RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedStarted := make(chan struct{})
+	workRan := false
+	submitted := make(chan error, 1)
+	go func() {
+		submitted <- q.SubmitWithAccepted(context.Background(), "admitting", func(ctx context.Context) error {
+			close(acceptedStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}, func(context.Context) error {
+			workRan = true
+			return nil
+		})
+	}()
+	<-acceptedStarted
+	if err := q.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-submitted; !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("admitting request result = %v, want ErrQueueClosed", err)
+	}
+	if workRan {
+		t.Fatal("work ran after shutdown canceled its admission callback")
 	}
 }
 

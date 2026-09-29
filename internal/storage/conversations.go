@@ -116,6 +116,34 @@ func (r *Repository) RecordUserMessage(ctx context.Context, in UserMessage, now 
 	}
 }
 
+// HasDiscordMessage reports whether a message with the given Discord message
+// ID has already been persisted. It is a read-only check for filtering
+// duplicate Discord events before queue admission.
+func (r *Repository) HasDiscordMessage(ctx context.Context, discordMessageID string) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("storage: repository is nil")
+	}
+	if ctx == nil {
+		return false, errors.New("storage: context is nil")
+	}
+	if strings.TrimSpace(discordMessageID) == "" {
+		return false, errors.New("storage: Discord message id is empty")
+	}
+
+	var exists bool
+	err := r.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE discord_message_id = ?)`,
+		discordMessageID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("storage: check Discord message: %w", err)
+	}
+	return exists, nil
+}
+
 func isSQLiteBusyOrLocked(err error) bool {
 	var coded interface{ Code() int }
 	if !errors.As(err, &coded) {
