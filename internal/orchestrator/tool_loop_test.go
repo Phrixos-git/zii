@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -133,6 +136,109 @@ func TestToolLoopReturnsFinalAnswerAndKeepsToolMessagesRequestLocal(t *testing.T
 	}
 	if len(fakeLLM.definitions[0]) != 3 || len(fakeLLM.definitions[1]) != 3 {
 		t.Fatalf("tool definitions were not supplied: %+v", fakeLLM.definitions)
+	}
+}
+
+func TestToolLoopRejectsEmptyFinalContentEvenWhenReasoningExists(t *testing.T) {
+	fakeLLM := &fakeLoopLLM{responses: []llm.Completion{{
+		FinishReason: "stop",
+		Message:      chat.Message{Role: "assistant", ReasoningContent: "internal reasoning"},
+	}}}
+	loop, err := NewToolLoop(fakeLLM, &fakeLoopSearch{}, newTestRegistry(t))
+	if err != nil {
+		t.Fatalf("NewToolLoop: %v", err)
+	}
+	_, err = loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "question"}})
+	if err == nil || err.Error() != "orchestrator: final answer is empty" {
+		t.Fatalf("Run error = %v, want final answer is empty", err)
+	}
+}
+
+func TestToolLoopRoundTripsReasoningAcrossMultipleToolCallTurns(t *testing.T) {
+	var chatRequestCount int
+	var requestMessages [][]chat.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/chat/completions/input_tokens":
+			_, _ = io.WriteString(w, `{"input_tokens":1}`)
+		case "/v1/chat/completions":
+			var request struct {
+				Messages []chat.Message `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode chat request: %v", err)
+				http.Error(w, "invalid request", http.StatusBadRequest)
+				return
+			}
+			requestMessages = append(requestMessages, request.Messages)
+			chatRequestCount++
+			switch chatRequestCount {
+			case 1:
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"reasoning one","tool_calls":[{"id":"call-1","type":"function","function":{"name":"search_web","arguments":"{\"query\":\"first\"}"}}]},"finish_reason":"tool_calls"}]}`)
+			case 2:
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"intermediate content","reasoning_content":"reasoning two","tool_calls":[{"id":"call-2","type":"function","function":{"name":"fetch_page","arguments":"{\"query\":\"https://example.com\"}"}}]},"finish_reason":"tool_calls"}]}`)
+			case 3:
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"final answer","reasoning_content":"final internal reasoning"},"finish_reason":"stop"}]}`)
+			default:
+				t.Errorf("unexpected chat request %d", chatRequestCount)
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	profile := llm.ModelProfile{
+		ID:       "reasoning-round-trip",
+		Model:    "test-model",
+		Endpoint: server.URL,
+		Capabilities: llm.Capabilities{
+			Tools:            true,
+			ReasoningContent: true,
+		},
+	}
+	client, err := llm.NewClient(llm.Config{Profile: profile, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	search := &fakeLoopSearch{results: []searchmcp.ToolResult{
+		{Data: json.RawMessage(`{"results":["first result"]}`)},
+		{Data: json.RawMessage(`{"page":"second result"}`)},
+	}}
+	loop, err := NewToolLoop(client, search, newTestRegistry(t))
+	if err != nil {
+		t.Fatalf("NewToolLoop: %v", err)
+	}
+	loop.mcpRetryDelay = 0
+
+	answer, err := loop.Run(context.Background(), []chat.Message{{Role: "user", Content: "question"}})
+	if err != nil || answer != "final answer" {
+		t.Fatalf("Run = %q, %v", answer, err)
+	}
+	if chatRequestCount != 3 || len(requestMessages) != 3 {
+		t.Fatalf("chat request count = %d, messages captured = %d; want 3", chatRequestCount, len(requestMessages))
+	}
+	assertExchange := func(requestIndex, assistantIndex, toolIndex int, wantContent, wantReasoning, wantCallID, wantToolName string) {
+		t.Helper()
+		messages := requestMessages[requestIndex]
+		if len(messages) <= toolIndex {
+			t.Fatalf("request %d has only %d messages; want tool message at %d", requestIndex+1, len(messages), toolIndex)
+		}
+		assistant := messages[assistantIndex]
+		if assistant.Role != "assistant" || assistant.Content != wantContent || assistant.ReasoningContent != wantReasoning || len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != wantCallID || assistant.ToolCalls[0].Type != "function" || assistant.ToolCalls[0].Function.Name != wantToolName || len(assistant.ToolCalls[0].Function.Arguments) == 0 {
+			t.Fatalf("request %d assistant exchange = %+v", requestIndex+1, assistant)
+		}
+		tool := messages[toolIndex]
+		if tool.Role != "tool" || tool.ToolCallID != wantCallID || tool.Name != wantToolName || tool.Content == "" {
+			t.Fatalf("request %d tool exchange = %+v", requestIndex+1, tool)
+		}
+	}
+	assertExchange(1, 1, 2, "", "reasoning one", "call-1", "search_web")
+	assertExchange(2, 1, 2, "", "reasoning one", "call-1", "search_web")
+	assertExchange(2, 3, 4, "intermediate content", "reasoning two", "call-2", "fetch_page")
+	if len(search.calls) != 2 {
+		t.Fatalf("Search MCP calls = %v; want two calls", search.calls)
 	}
 }
 

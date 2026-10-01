@@ -121,11 +121,32 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 	callCounts := make(map[string]int)
 	totalCalls := 0
 	toolsDisabled := false
+	toolsDisabledReason := ""
+	inferenceTurn := 0
+	disableTools := func(reason string) {
+		if !toolsDisabled {
+			toolsDisabledReason = reason
+			slog.Debug("Tool calling disabled", "component", "orchestrator", "event", "tool_calling_disabled",
+				"request_id", RequestIDFromContext(ctx), "inference_turn", inferenceTurn, "reason", reason)
+		}
+		toolsDisabled = true
+	}
+	var registeredToolNames []string
+	for _, definition := range l.registry.LLMTools() {
+		registeredToolNames = append(registeredToolNames, definition.Name)
+	}
 	finalRetryUsed := false
+	toolLimitInstructionAdded := false
 
 	for turn := 0; turn <= l.maxToolCalls+1; turn++ {
+		inferenceTurn = turn + 1
 		if err := ctx.Err(); err != nil {
 			return "", err
+		}
+		toolLimitFinal := toolsDisabled && totalCalls >= l.maxToolCalls
+		if toolLimitFinal && !toolLimitInstructionAdded {
+			messages = prependToolLimitInstruction(messages)
+			toolLimitInstructionAdded = true
 		}
 		var definitions []llm.ToolDefinition
 		if !toolsDisabled && l.profile.Capabilities.Tools {
@@ -137,20 +158,32 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			return "", ctx.Err()
 		}
 		started := time.Now()
+		disabledReason := toolsDisabledReason
+		if !l.profile.Capabilities.Tools {
+			disabledReason = "model_profile_tools_disabled"
+		}
+		callCtx := llm.WithToolLoopDiagnostics(ctx, llm.ToolLoopDiagnostics{
+			InferenceTurn: turn + 1, ToolsDisabled: toolsDisabled || !l.profile.Capabilities.Tools,
+			ToolsDisabledReason: disabledReason, RegisteredToolNames: registeredToolNames,
+		})
 		var completion llm.Completion
 		var err error
-		if finalRetryUsed {
+		if finalRetryUsed || toolLimitFinal {
+			options := llm.ChatOptions{ToolChoice: "none"}
+			if finalRetryUsed {
+				options = truncatedRetryOptions
+			}
 			if client, ok := l.llm.(interface {
 				ChatWithOptions(context.Context, []chat.Message, []llm.ToolDefinition, llm.ChatOptions) (llm.Completion, error)
 			}); ok {
-				completion, err = client.ChatWithOptions(ctx, messages, definitions, truncatedRetryOptions)
+				completion, err = client.ChatWithOptions(callCtx, messages, definitions, options)
 			} else {
 				// Keep alternate ChatClient implementations usable. The application
 				// LLM client supports per-request options and takes the branch above.
-				completion, err = l.llm.Chat(ctx, messages, definitions)
+				completion, err = l.llm.Chat(callCtx, messages, definitions)
 			}
 		} else {
-			completion, err = l.llm.Chat(ctx, messages, definitions)
+			completion, err = l.llm.Chat(callCtx, messages, definitions)
 		}
 		<-l.llmSlots
 		if err != nil {
@@ -161,7 +194,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 					return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
 				}
 				finalRetryUsed = true
-				toolsDisabled = true
+				disableTools("output_limit_retry")
 				continue
 			}
 			return "", fmt.Errorf("orchestrator: LLM completion: %w", err)
@@ -188,7 +221,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 					return "", fmt.Errorf("orchestrator: prepare tool-markup retry: %w", err)
 				}
 				finalRetryUsed = true
-				toolsDisabled = true
+				disableTools("tool_markup_retry")
 				continue
 			}
 			return answer, nil
@@ -214,7 +247,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 				return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
 			}
 			finalRetryUsed = true
-			toolsDisabled = true
+			disableTools("output_limit_retry")
 			continue
 		default:
 			return "", fmt.Errorf("orchestrator: unsupported LLM finish reason %q", completion.FinishReason)
@@ -243,7 +276,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 					callCounts[callName]++
 					switch {
 					case toolsDisabled || totalCalls > l.maxToolCalls:
-						toolsDisabled = true
+						disableTools("tool_call_limit_reached")
 						toolContent = safeToolError("tool_limit_reached", false, "")
 					case callCounts[callName] > l.callLimits[callName]:
 						toolContent = safeToolError("rate_limited", false, "")
@@ -275,16 +308,16 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 				if !errors.Is(fitErr, errToolContextFull) {
 					return "", fitErr
 				}
-				toolsDisabled = true
+				disableTools("context_budget_reached")
 				content = string(safeToolError("context_budget_reached", false, ""))
 			} else if budgetFull {
-				toolsDisabled = true
+				disableTools("context_budget_reached")
 			}
 			toolMessage := chat.Message{Role: "tool", ToolCallID: call.ID, Name: callName, Content: content}
 			messages = append(messages, toolMessage)
 			toolMessages = append(toolMessages, toolMessage)
 			if totalCalls >= l.maxToolCalls {
-				toolsDisabled = true
+				disableTools("tool_call_limit_reached")
 			}
 		}
 	}
@@ -296,6 +329,17 @@ var truncatedRetryOptions = llm.ChatOptions{
 	ReasoningEffort:      "medium",
 	ThinkingBudgetTokens: 2048,
 	ToolChoice:           "none",
+}
+
+func prependToolLimitInstruction(messages []chat.Message) []chat.Message {
+	instruction := "The tool call limit has been reached. Give the final answer now using only the information already collected in this conversation. Do not call tools or seek new evidence. Never output tool-call markup or syntax as text. Preserve source URLs or citations present in the collected evidence. If the information is insufficient, explain the limitation clearly. Answer in the user's language."
+	if len(messages) > 0 && messages[0].Role == "system" {
+		updated := append([]chat.Message(nil), messages...)
+		updated[0].Content = instruction + "\n\n" + updated[0].Content
+		return append(updated, chat.Message{Role: "user", Content: instruction})
+	}
+	updated := append([]chat.Message{{Role: "system", Content: instruction}}, messages...)
+	return append(updated, chat.Message{Role: "user", Content: instruction})
 }
 
 func (l *ToolLoop) prepareTruncatedRetry(ctx context.Context, messages []chat.Message) ([]chat.Message, error) {

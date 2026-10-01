@@ -80,6 +80,8 @@ type chatRequest struct {
 	Model             string         `json:"model"`
 	Messages          []chat.Message `json:"messages"`
 	Stream            bool           `json:"stream"`
+	Verbose           bool           `json:"verbose"`
+	ReturnTokens      bool           `json:"return_tokens"`
 	MaxTokens         int            `json:"max_tokens"`
 	ReasoningEffort   *string        `json:"reasoning_effort,omitempty"`
 	ThinkingBudget    *int           `json:"thinking_budget_tokens,omitempty"`
@@ -185,10 +187,12 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 		}
 	}
 	request := chatRequest{
-		Model:     c.model,
-		Messages:  requestMessages,
-		Stream:    false,
-		MaxTokens: maxTokens,
+		Model:        c.model,
+		Messages:     requestMessages,
+		Stream:       false,
+		Verbose:      true,
+		ReturnTokens: true,
+		MaxTokens:    maxTokens,
 	}
 	if capabilities.Reasoning && capabilities.ReasoningEffort && reasoningEffort != "" {
 		request.ReasoningEffort = &reasoningEffort
@@ -225,6 +229,19 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 	if err != nil {
 		return Completion{}, fmt.Errorf("llm: encode chat request: %w", err)
 	}
+	diagnostics, diagnosticsAvailable := toolLoopDiagnosticsFromContext(ctx)
+	var toolsDisabled *bool
+	if diagnosticsAvailable {
+		toolsDisabled = &diagnostics.ToolsDisabled
+	}
+	sentToolChoice := "omitted"
+	if request.ToolChoice != nil {
+		sentToolChoice = *request.ToolChoice
+	}
+	slog.Debug("LLM request metadata", "component", "llm", "event", "llm_request_metadata",
+		"request_id", requestIDFromContext(ctx), "inference_turn", diagnostics.InferenceTurn,
+		"tool_definition_count", len(request.Tools), "tool_choice", sentToolChoice,
+		"tools_disabled", toolsDisabled, "tools_disabled_reason", diagnostics.ToolsDisabledReason)
 	responseBody, err := c.postJSON(ctx, "/v1/chat/completions", body)
 	if err != nil {
 		return Completion{}, err
@@ -234,7 +251,8 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 			Message      chat.Message `json:"message"`
 			FinishReason *string      `json:"finish_reason"`
 		} `json:"choices"`
-		Usage Usage `json:"usage"`
+		Usage   Usage           `json:"usage"`
+		Verbose json.RawMessage `json:"__verbose"`
 	}
 	if err := json.Unmarshal(responseBody, &response); err != nil {
 		return Completion{}, fmt.Errorf("%w: decode response: %v", ErrResponse, err)
@@ -243,6 +261,19 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 		return Completion{}, fmt.Errorf("%w: expected one choice with a finish_reason", ErrResponse)
 	}
 	choice := response.Choices[0]
+	slog.Debug("LLM response metadata", "component", "llm", "event", "llm_response_metadata",
+		"request_id", requestIDFromContext(ctx),
+		"inference_turn", diagnostics.InferenceTurn,
+		"finish_reason", *choice.FinishReason,
+		"completion_tokens", response.Usage.CompletionTokens,
+		"content_empty", strings.TrimSpace(choice.Message.Content) == "",
+		"reasoning_content_present", strings.TrimSpace(choice.Message.ReasoningContent) != "",
+		"tool_call_count", len(choice.Message.ToolCalls))
+	var sentTools []ToolDefinition
+	if capabilities.Tools {
+		sentTools = tools
+	}
+	logRawResponseMetadata(ctx, response.Verbose, strings.TrimSpace(choice.Message.Content) == "", sentTools...)
 	if !capabilities.ReasoningContent {
 		choice.Message.ReasoningContent = ""
 	}

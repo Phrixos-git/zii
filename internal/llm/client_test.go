@@ -148,7 +148,7 @@ func TestChatOmitsReasoningSettingsWhenIndividualCapabilitiesAreDisabled(t *test
 
 func TestChatPreservesReasoningContentToolCallsAndUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"answer","reasoning_content":"private thoughts","tool_calls":[{"id":"c","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"lookup","arguments":{"id":2}}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"reasoning text","tool_calls":[{"id":"c","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"lookup","arguments":{"id":2}}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`)
 	}))
 	defer server.Close()
 	profile := ModelProfile{ID: "all", Model: "custom", Endpoint: server.URL, Capabilities: Capabilities{Tools: true, ReasoningContent: true, ParallelToolCalls: true}}
@@ -160,7 +160,7 @@ func TestChatPreservesReasoningContentToolCallsAndUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Message.Role != "assistant" || got.Message.Content != "answer" || got.Message.ReasoningContent != "private thoughts" || len(got.Message.ToolCalls) != 2 || got.Usage.TotalTokens != 7 {
+	if got.FinishReason != "tool_calls" || got.Message.Role != "assistant" || got.Message.Content != "" || got.Message.ReasoningContent != "reasoning text" || len(got.Message.ToolCalls) != 2 || got.Usage.TotalTokens != 7 {
 		t.Fatalf("completion = %+v", got)
 	}
 	if string(got.Message.ToolCalls[1].Function.Arguments) != `{"id":2}` {

@@ -3,7 +3,7 @@
 models:
   gpt-oss-20b:
     model: gpt-oss-20b
-    endpoint: http://gpt-oss-llm:8080
+    endpoint: http://127.0.0.1:28080
     capabilities:
       tools: true
       reasoning: true

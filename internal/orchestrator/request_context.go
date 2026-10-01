@@ -1,11 +1,16 @@
 package orchestrator
 
-import "context"
+import (
+	"context"
+
+	"github.com/Phrixos-git/zii/internal/llm"
+)
 
 type requestIDContextKey struct{}
 
 func withRequestID(ctx context.Context, requestID string) context.Context {
-	return context.WithValue(ctx, requestIDContextKey{}, requestID)
+	ctx = context.WithValue(ctx, requestIDContextKey{}, requestID)
+	return llm.WithRequestID(ctx, requestID)
 }
 
 func RequestIDFromContext(ctx context.Context) string {
