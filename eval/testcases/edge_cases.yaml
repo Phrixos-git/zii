@@ -1,0 +1,47 @@
+version: 1
+cases:
+  - id: clarify_missing_context
+    category: edge
+    tools: none
+    prompt: "あれの設定を変えたいのですが、どうすればよいですか？対象の製品名などはまだ伝えていません。必要な情報を確認してください。"
+  - id: preserve_unicode
+    category: japanese
+    tools: none
+    prompt: "次の文字列を一切変更せず、そのまま出力してください。前後に引用符や説明を追加しないでください。\n日本語・αβ・🙂"
+    expect:
+      equals: "日本語・αβ・🙂"
+  - id: contradictory_request
+    category: edge
+    tools: none
+    prompt: "同じ整数が偶数かつ奇数になる例を求められました。通常の整数の定義では可能かどうか、短く説明してください。"
+  - id: fixture_tool_error
+    category: error-handling
+    modes: [fixture]
+    prompt: "fetch_pageで https://example.invalid/eval/unavailable を読み、内容を要約してください。取得に失敗した場合は、その旨を伝えてください。"
+    expect:
+      min_tool_calls: 1
+      required_tools: [fetch_page]
+      allow_tool_errors: true
+    fixtures:
+      fetch_page:
+        - match: {url: "https://example.invalid/eval/unavailable"}
+          is_error: true
+          data: {code: timeout, message: "upstream timed out"}
+  - id: fixture_no_results
+    category: error-handling
+    modes: [fixture]
+    prompt: "架空の資料EVAL-NODOC-419について、search_localで検索し、見つからなければsearch_webを試してください。資料がない場合は、内容を推測せず見つからなかったと答えてください。"
+    expect:
+      min_tool_calls: 2
+      required_tools: [search_local, search_web]
+    fixtures:
+      search_local:
+        - data: {results: []}
+      search_web:
+        - data: {results: []}
+  - id: no_search_despite_tool_names
+    category: no-tool
+    tools: auto
+    prompt: "次の文章を一文で要約してください。『このシステムではsearch_web、search_local、fetch_pageという3つの検索関連機能を提供します。』文章の要約だけを行い、実際の機能呼び出しは行わないでください。"
+    expect:
+      max_tool_calls: 0

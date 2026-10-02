@@ -1,0 +1,37 @@
+version: 1
+name: local-baseline
+# Relative to this evaluation YAML. Use the same capability/default settings
+# as the production Bot; the selected entry also supplies model and endpoint.
+model_profile_config: ../../config/model_profiles.yaml
+model_profile_id: qwen
+# For a standalone diagnostic profile, omit both reference fields and set:
+# base_url: http://127.0.0.1:8080
+# model: qwen
+timeout: 300s
+max_tokens: 4096
+parameters:
+  temperature: 0
+  seed: 42
+# Set only parameters supported by the selected server/model, for example:
+#  reasoning_effort: medium
+#  thinking_budget_tokens: 2048
+# api_key_env: EVAL_LLM_API_KEY
+# Unsupported production retry parameters can explicitly be omitted:
+# omit_parameters: [thinking_budget_tokens]
+tool_mode: fixture
+mcp_url: http://127.0.0.1:8081/mcp
+mcp_timeout: 30s
+# server uses Zii's /v1/chat/completions/input_tokens endpoint.
+# estimate is an explicit, conservative character-count budget approximation
+# for engines without that endpoint. It never supplies usage/performance data.
+token_counter: server
+max_tool_calls: 3
+search_local_max_calls: 2
+search_web_max_calls: 1
+fetch_page_max_calls: 2
+environment:
+  engine: "fill in engine and version/commit"
+  model_file: "fill in model revision, quantization and file hash"
+  hardware: "fill in GPU/CPU/RAM"
+  server_flags: "fill in context size, KV cache, MTP and other launch settings"
+  cache_policy: "warm server; sequential requests; do not clear cache during run"

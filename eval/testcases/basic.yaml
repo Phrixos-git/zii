@@ -1,0 +1,45 @@
+version: 1
+cases:
+  - id: greeting_ja
+    category: basic
+    tools: auto
+    prompt: "こんばんは。今日の作業を始めるので、短い挨拶を一文ください。検索は不要です。"
+    expect:
+      max_tool_calls: 0
+  - id: arithmetic_exact
+    category: basic
+    tools: none
+    prompt: "17 × 24 を計算してください。答えの半角数字だけを出力してください。"
+    expect:
+      equals: "408"
+      max_tool_calls: 0
+  - id: summarize_given_text
+    category: japanese
+    tools: auto
+    prompt: "次の連絡から締切と公開予定日を抜き出してください。検索は不要です。『資料の提出締切は10月5日、公開予定日は10月8日です。確認担当は佐藤さんです。』"
+    expect:
+      contains: ["10月5日", "10月8日"]
+      max_tool_calls: 0
+  - id: json_only
+    category: basic
+    tools: none
+    prompt: '次のJSONを変更せず、そのJSONだけを出力してください。コードブロックや説明は不要です。{"status":"ok","count":3}'
+    expect:
+      equals: '{"status":"ok","count":3}'
+  - id: fixed_history
+    category: basic
+    tools: none
+    history:
+      - role: user
+        content: "この会話では私が選んだ色は青です。"
+      - role: assistant
+        content: "選んだ色は青ですね。"
+    prompt: "この会話で私が選んだ色を、色名だけで答えてください。"
+    expect:
+      equals: "青"
+  - id: japanese_rewrite
+    category: japanese
+    tools: none
+    prompt: "『明日の会議には参加できません。』を丁寧な表現に言い換えてください。一文で答えてください。"
+    expect:
+      contains: ["明日", "会議"]
