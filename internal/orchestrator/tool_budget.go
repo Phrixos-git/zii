@@ -27,15 +27,42 @@ var errToolContextFull = errors.New("orchestrator: tool context budget is full")
 // measurements must include it.
 const tokenCountUserMarker = "[tool result token counting]"
 
-// countMessages builds the token-count-only message sequence for a tool
-// result budget check: the fixed user marker, the relevant prior tool
-// messages, and the candidate tool result.
-func countMessages(previous []chat.Message, content string) []chat.Message {
-	messages := make([]chat.Message, 0, len(previous)+2)
+// countMessages builds a template-valid token-count-only transcript containing
+// the fixed user marker and the relevant prior and candidate tool exchanges.
+func countMessages(previous []chat.Message, toolName, content string) []chat.Message {
+	messages := make([]chat.Message, 0, 1+2*(len(previous)+1))
 	messages = append(messages, chat.Message{Role: "user", Content: tokenCountUserMarker})
-	messages = append(messages, previous...)
-	messages = append(messages, chat.Message{Role: "tool", Content: content})
+	for i, message := range previous {
+		messages = appendTokenCountToolExchange(messages, message, i)
+	}
+	messages = appendTokenCountToolExchange(messages, chat.Message{Role: "tool", Name: toolName, Content: content}, len(previous))
 	return messages
+}
+
+func appendTokenCountToolExchange(messages []chat.Message, toolMessage chat.Message, index int) []chat.Message {
+	callID := strings.TrimSpace(toolMessage.ToolCallID)
+	if callID == "" {
+		callID = fmt.Sprintf("zii-token-count-%d", index)
+	}
+	toolName := strings.TrimSpace(toolMessage.Name)
+	if toolName == "" {
+		toolName = "token_count_result"
+	}
+	toolMessage.Role = "tool"
+	toolMessage.ToolCallID = callID
+	toolMessage.Name = toolName
+	assistantMessage := chat.Message{
+		Role: "assistant",
+		ToolCalls: []chat.ToolCall{{
+			ID:   callID,
+			Type: "function",
+			Function: chat.FunctionCall{
+				Name:      toolName,
+				Arguments: json.RawMessage(`{}`),
+			},
+		}},
+	}
+	return append(messages, assistantMessage, toolMessage)
 }
 
 func countMarkerTokens(ctx context.Context, counter TokenCounter) (int, error) {
@@ -52,8 +79,8 @@ func countMarkerTokens(ctx context.Context, counter TokenCounter) (int, error) {
 // countToolContentTokens returns the token count of the candidate tool
 // content with the fixed user marker excluded. The caller measures the marker
 // once per high-level fit operation and reuses it for all binary-search probes.
-func countToolContentTokens(ctx context.Context, counter TokenCounter, markerTokens int, previous []chat.Message, content string) (int, error) {
-	full, err := counter.CountTokens(ctx, countMessages(previous, content))
+func countToolContentTokens(ctx context.Context, counter TokenCounter, markerTokens int, previous []chat.Message, toolName, content string) (int, error) {
+	full, err := counter.CountTokens(ctx, countMessages(previous, toolName, content))
 	if err != nil {
 		return 0, err
 	}
@@ -88,7 +115,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 	full := string(result)
 	page := toolName == "fetch_page"
 	if !forceTruncation {
-		fits, err := b.fits(ctx, markerTokens, previous, full, page)
+		fits, err := b.fits(ctx, markerTokens, previous, toolName, full, page)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -106,7 +133,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 		if err != nil {
 			return "", false, false, fmt.Errorf("orchestrator: encode truncated tool result: %w", err)
 		}
-		fits, err := b.fits(ctx, markerTokens, previous, candidate, page)
+		fits, err := b.fits(ctx, markerTokens, previous, toolName, candidate, page)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -120,7 +147,7 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 	if best == "" {
 		return "", false, true, errToolContextFull
 	}
-	used, err := countToolContentTokens(ctx, b.counter, markerTokens, previous, best)
+	used, err := countToolContentTokens(ctx, b.counter, markerTokens, previous, toolName, best)
 	if err != nil {
 		return "", false, false, fmt.Errorf("orchestrator: count truncated tool context: %w", err)
 	}
@@ -128,8 +155,8 @@ func (b toolResultBudget) fit(ctx context.Context, toolName string, previous []c
 	return best, true, fullBudget, nil
 }
 
-func (b toolResultBudget) fits(ctx context.Context, markerTokens int, previous []chat.Message, content string, page bool) (bool, error) {
-	totalTokens, err := countToolContentTokens(ctx, b.counter, markerTokens, previous, content)
+func (b toolResultBudget) fits(ctx context.Context, markerTokens int, previous []chat.Message, toolName, content string, page bool) (bool, error) {
+	totalTokens, err := countToolContentTokens(ctx, b.counter, markerTokens, previous, toolName, content)
 	if err != nil {
 		return false, fmt.Errorf("orchestrator: count tool result context: %w", err)
 	}
@@ -137,7 +164,7 @@ func (b toolResultBudget) fits(ctx context.Context, markerTokens int, previous [
 		return false, nil
 	}
 	if page {
-		pageTokens, err := countToolContentTokens(ctx, b.counter, markerTokens, nil, content)
+		pageTokens, err := countToolContentTokens(ctx, b.counter, markerTokens, nil, toolName, content)
 		if err != nil {
 			return false, fmt.Errorf("orchestrator: count fetch_page result: %w", err)
 		}
@@ -187,7 +214,7 @@ func compactToolResults(ctx context.Context, counter TokenCounter, messages []ch
 		}
 		seen++
 		targetTokens := maxRetryToolTokens * seen / toolCount
-		content, err := fitRetryToolResult(ctx, counter, markerTokens, previous, compacted[i].Content, targetTokens)
+		content, err := fitRetryToolResult(ctx, counter, markerTokens, previous, compacted[i].Name, compacted[i].Content, targetTokens)
 		if err != nil {
 			return nil, err
 		}
@@ -197,9 +224,9 @@ func compactToolResults(ctx context.Context, counter TokenCounter, messages []ch
 	return compacted, nil
 }
 
-func fitRetryToolResult(ctx context.Context, counter TokenCounter, markerTokens int, previous []chat.Message, content string, targetTokens int) (string, error) {
+func fitRetryToolResult(ctx context.Context, counter TokenCounter, markerTokens int, previous []chat.Message, toolName, content string, targetTokens int) (string, error) {
 	count := func(candidate string) (int, error) {
-		tokens, err := countToolContentTokens(ctx, counter, markerTokens, previous, candidate)
+		tokens, err := countToolContentTokens(ctx, counter, markerTokens, previous, toolName, candidate)
 		if err != nil {
 			return 0, fmt.Errorf("orchestrator: count retry tool result: %w", err)
 		}

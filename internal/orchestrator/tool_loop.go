@@ -49,9 +49,13 @@ type ToolLoop struct {
 	mcpSlots      chan struct{}
 	maxToolCalls  int
 	callLimits    map[string]int
+	profile       llm.ModelProfile
 }
 
-type ToolLoopConfig struct{ MaxCalls, SearchLocalMaxCalls, SearchWebMaxCalls, FetchPageMaxCalls, LLMMaxConcurrency, MCPMaxConcurrency int }
+type ToolLoopConfig struct {
+	MaxCalls, SearchLocalMaxCalls, SearchWebMaxCalls, FetchPageMaxCalls, LLMMaxConcurrency, MCPMaxConcurrency int
+	Profile                                                                                                   *llm.ModelProfile
+}
 
 func NewToolLoop(client ChatClient, search SearchToolClient, registry ToolRegistry) (*ToolLoop, error) {
 	return NewToolLoopWithConfig(client, search, registry, ToolLoopConfig{MaxCalls: maxToolCallsPerRequest, SearchLocalMaxCalls: maxSearchLocalCalls, SearchWebMaxCalls: maxSearchWebCalls, FetchPageMaxCalls: maxFetchPageCalls, LLMMaxConcurrency: defaultLLMConcurrency, MCPMaxConcurrency: defaultMCPConcurrency})
@@ -79,6 +83,13 @@ func NewToolLoopWithConfig(client ChatClient, search SearchToolClient, registry 
 	if cfg.LLMMaxConcurrency < 1 || cfg.MCPMaxConcurrency < 1 {
 		return nil, errors.New("orchestrator: concurrency limits must be positive")
 	}
+	profile := llm.ModelProfile{ID: "legacy-chat-client", Capabilities: llm.Capabilities{Tools: true, Reasoning: true, ReasoningContent: true, ReasoningEffort: true, ThinkingBudget: true}}
+	if provider, ok := client.(interface{ ModelProfile() llm.ModelProfile }); ok {
+		profile = provider.ModelProfile()
+	}
+	if cfg.Profile != nil {
+		profile = *cfg.Profile
+	}
 	return &ToolLoop{
 		llm:           client,
 		search:        search,
@@ -89,6 +100,7 @@ func NewToolLoopWithConfig(client ChatClient, search SearchToolClient, registry 
 		mcpSlots:      make(chan struct{}, cfg.MCPMaxConcurrency),
 		maxToolCalls:  cfg.MaxCalls,
 		callLimits:    map[string]int{"search_local": cfg.SearchLocalMaxCalls, "search_web": cfg.SearchWebMaxCalls, "fetch_page": cfg.FetchPageMaxCalls},
+		profile:       profile,
 	}, nil
 }
 
@@ -109,14 +121,35 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 	callCounts := make(map[string]int)
 	totalCalls := 0
 	toolsDisabled := false
+	toolsDisabledReason := ""
+	inferenceTurn := 0
+	disableTools := func(reason string) {
+		if !toolsDisabled {
+			toolsDisabledReason = reason
+			slog.Debug("Tool calling disabled", "component", "orchestrator", "event", "tool_calling_disabled",
+				"request_id", RequestIDFromContext(ctx), "inference_turn", inferenceTurn, "reason", reason)
+		}
+		toolsDisabled = true
+	}
+	var registeredToolNames []string
+	for _, definition := range l.registry.LLMTools() {
+		registeredToolNames = append(registeredToolNames, definition.Name)
+	}
 	finalRetryUsed := false
+	toolLimitInstructionAdded := false
 
 	for turn := 0; turn <= l.maxToolCalls+1; turn++ {
+		inferenceTurn = turn + 1
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
+		toolLimitFinal := toolsDisabled && totalCalls >= l.maxToolCalls
+		if toolLimitFinal && !toolLimitInstructionAdded {
+			messages = prependToolLimitInstruction(messages)
+			toolLimitInstructionAdded = true
+		}
 		var definitions []llm.ToolDefinition
-		if !toolsDisabled {
+		if !toolsDisabled && l.profile.Capabilities.Tools {
 			definitions = l.registry.LLMTools()
 		}
 		select {
@@ -125,20 +158,32 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			return "", ctx.Err()
 		}
 		started := time.Now()
+		disabledReason := toolsDisabledReason
+		if !l.profile.Capabilities.Tools {
+			disabledReason = "model_profile_tools_disabled"
+		}
+		callCtx := llm.WithToolLoopDiagnostics(ctx, llm.ToolLoopDiagnostics{
+			InferenceTurn: turn + 1, ToolsDisabled: toolsDisabled || !l.profile.Capabilities.Tools,
+			ToolsDisabledReason: disabledReason, RegisteredToolNames: registeredToolNames,
+		})
 		var completion llm.Completion
 		var err error
-		if finalRetryUsed {
+		if finalRetryUsed || toolLimitFinal {
+			options := llm.ChatOptions{ToolChoice: "none"}
+			if finalRetryUsed {
+				options = truncatedRetryOptions
+			}
 			if client, ok := l.llm.(interface {
 				ChatWithOptions(context.Context, []chat.Message, []llm.ToolDefinition, llm.ChatOptions) (llm.Completion, error)
 			}); ok {
-				completion, err = client.ChatWithOptions(ctx, messages, definitions, truncatedRetryOptions)
+				completion, err = client.ChatWithOptions(callCtx, messages, definitions, options)
 			} else {
 				// Keep alternate ChatClient implementations usable. The application
 				// LLM client supports per-request options and takes the branch above.
-				completion, err = l.llm.Chat(ctx, messages, definitions)
+				completion, err = l.llm.Chat(callCtx, messages, definitions)
 			}
 		} else {
-			completion, err = l.llm.Chat(ctx, messages, definitions)
+			completion, err = l.llm.Chat(callCtx, messages, definitions)
 		}
 		<-l.llmSlots
 		if err != nil {
@@ -149,7 +194,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 					return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
 				}
 				finalRetryUsed = true
-				toolsDisabled = true
+				disableTools("output_limit_retry")
 				continue
 			}
 			return "", fmt.Errorf("orchestrator: LLM completion: %w", err)
@@ -176,7 +221,7 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 					return "", fmt.Errorf("orchestrator: prepare tool-markup retry: %w", err)
 				}
 				finalRetryUsed = true
-				toolsDisabled = true
+				disableTools("tool_markup_retry")
 				continue
 			}
 			return answer, nil
@@ -184,8 +229,14 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 			if finalRetryUsed {
 				return "", errors.New("orchestrator: final-answer retry returned structured tool calls")
 			}
-			if completion.Message.Role != "assistant" || len(completion.Message.ToolCalls) != 1 {
-				return "", fmt.Errorf("orchestrator: expected one assistant tool call")
+			if completion.Message.Role != "assistant" || len(completion.Message.ToolCalls) == 0 {
+				return "", fmt.Errorf("orchestrator: expected assistant tool calls")
+			}
+			if !l.profile.Capabilities.Tools {
+				return "", errors.New("orchestrator: model profile does not allow tools")
+			}
+			if len(completion.Message.ToolCalls) > 1 && !l.profile.Capabilities.ParallelToolCalls {
+				return "", errors.New("orchestrator: model profile does not allow multiple tool calls")
 			}
 		case "length":
 			if finalRetryUsed {
@@ -196,78 +247,78 @@ func (l *ToolLoop) Run(ctx context.Context, initial []chat.Message) (string, err
 				return "", fmt.Errorf("orchestrator: prepare truncated-response retry: %w", err)
 			}
 			finalRetryUsed = true
-			toolsDisabled = true
+			disableTools("output_limit_retry")
 			continue
 		default:
 			return "", fmt.Errorf("orchestrator: unsupported LLM finish reason %q", completion.FinishReason)
 		}
 
-		call := completion.Message.ToolCalls[0]
-		if strings.TrimSpace(call.ID) == "" || call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
-			return "", errors.New("orchestrator: malformed LLM tool call")
-		}
+		assistantMessageIndex := len(messages)
 		messages = append(messages, completion.Message)
-		toolContent := []byte{}
-		callName := call.Function.Name
-		totalCalls++
-
-		// Validate in the same order as the runtime contract. In particular,
-		// do not parse or expose arguments for a tool outside the allowlist.
-		if !l.registry.IsAllowed(callName) {
-			toolContent = safeToolError("not_found", false, "")
-		} else if arguments, argsErr := call.Function.NormalizedArguments(); argsErr != nil {
-			toolContent = safeToolError("invalid_argument", false, "")
-		} else {
-			completion.Message.ToolCalls[0].Function.Arguments = arguments
-			messages[len(messages)-1] = completion.Message
-			if err := l.registry.Validate(callName, arguments); err != nil {
+		for callIndex := range completion.Message.ToolCalls {
+			call := completion.Message.ToolCalls[callIndex]
+			if strings.TrimSpace(call.ID) == "" || call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
+				return "", errors.New("orchestrator: malformed LLM tool call")
+			}
+			toolContent := []byte{}
+			callName := call.Function.Name
+			totalCalls++
+			if !l.registry.IsAllowed(callName) {
+				toolContent = safeToolError("not_found", false, "")
+			} else if arguments, argsErr := call.Function.NormalizedArguments(); argsErr != nil {
 				toolContent = safeToolError("invalid_argument", false, "")
 			} else {
-				callCounts[callName]++
-				switch {
-				case toolsDisabled || totalCalls > l.maxToolCalls:
-					toolsDisabled = true
-					toolContent = safeToolError("tool_limit_reached", false, "")
-				case callCounts[callName] > l.callLimits[callName]:
-					toolContent = safeToolError("rate_limited", false, "")
-				default:
-					if signature, err := normalizedCallSignature(callName, arguments); err != nil {
-						toolContent = safeToolError("invalid_argument", false, "")
-					} else if _, duplicate := seenCalls[signature]; duplicate {
-						toolContent = safeToolError("duplicate_call", false, "")
-					} else {
-						seenCalls[signature] = struct{}{}
-						result, invokeErr := l.invoke(ctx, callName, arguments)
-						if invokeErr != nil {
-							if ctx.Err() != nil {
-								return "", ctx.Err()
-							}
-							toolContent = safeToolError("tool_unavailable", true, "")
-						} else if result.IsError {
-							toolContent = sanitizeMCPError(result.Data)
+				completion.Message.ToolCalls[callIndex].Function.Arguments = arguments
+				messages[assistantMessageIndex] = completion.Message
+				if err := l.registry.Validate(callName, arguments); err != nil {
+					toolContent = safeToolError("invalid_argument", false, "")
+				} else {
+					callCounts[callName]++
+					switch {
+					case toolsDisabled || totalCalls > l.maxToolCalls:
+						disableTools("tool_call_limit_reached")
+						toolContent = safeToolError("tool_limit_reached", false, "")
+					case callCounts[callName] > l.callLimits[callName]:
+						toolContent = safeToolError("rate_limited", false, "")
+					default:
+						if signature, err := normalizedCallSignature(callName, arguments); err != nil {
+							toolContent = safeToolError("invalid_argument", false, "")
+						} else if _, duplicate := seenCalls[signature]; duplicate {
+							toolContent = safeToolError("duplicate_call", false, "")
 						} else {
-							toolContent = result.Data
+							seenCalls[signature] = struct{}{}
+							result, invokeErr := l.invoke(ctx, callName, arguments)
+							if invokeErr != nil {
+								if ctx.Err() != nil {
+									return "", ctx.Err()
+								}
+								toolContent = safeToolError("tool_unavailable", true, "")
+							} else if result.IsError {
+								toolContent = sanitizeMCPError(result.Data)
+							} else {
+								toolContent = result.Data
+							}
 						}
 					}
 				}
 			}
-		}
 
-		content, _, budgetFull, fitErr := l.budget.fit(ctx, callName, toolMessages, toolContent)
-		if fitErr != nil {
-			if !errors.Is(fitErr, errToolContextFull) {
-				return "", fitErr
+			content, _, budgetFull, fitErr := l.budget.fit(ctx, callName, toolMessages, toolContent)
+			if fitErr != nil {
+				if !errors.Is(fitErr, errToolContextFull) {
+					return "", fitErr
+				}
+				disableTools("context_budget_reached")
+				content = string(safeToolError("context_budget_reached", false, ""))
+			} else if budgetFull {
+				disableTools("context_budget_reached")
 			}
-			toolsDisabled = true
-			content = string(safeToolError("context_budget_reached", false, ""))
-		} else if budgetFull {
-			toolsDisabled = true
-		}
-		toolMessage := chat.Message{Role: "tool", ToolCallID: call.ID, Name: callName, Content: content}
-		messages = append(messages, toolMessage)
-		toolMessages = append(toolMessages, toolMessage)
-		if totalCalls >= l.maxToolCalls {
-			toolsDisabled = true
+			toolMessage := chat.Message{Role: "tool", ToolCallID: call.ID, Name: callName, Content: content}
+			messages = append(messages, toolMessage)
+			toolMessages = append(toolMessages, toolMessage)
+			if totalCalls >= l.maxToolCalls {
+				disableTools("tool_call_limit_reached")
+			}
 		}
 	}
 	return "", errors.New("orchestrator: tool loop exceeded its inference limit")
@@ -278,6 +329,17 @@ var truncatedRetryOptions = llm.ChatOptions{
 	ReasoningEffort:      "medium",
 	ThinkingBudgetTokens: 2048,
 	ToolChoice:           "none",
+}
+
+func prependToolLimitInstruction(messages []chat.Message) []chat.Message {
+	instruction := "The tool call limit has been reached. Give the final answer now using only the information already collected in this conversation. Do not call tools or seek new evidence. Never output tool-call markup or syntax as text. Preserve source URLs or citations present in the collected evidence. If the information is insufficient, explain the limitation clearly. Answer in the user's language."
+	if len(messages) > 0 && messages[0].Role == "system" {
+		updated := append([]chat.Message(nil), messages...)
+		updated[0].Content = instruction + "\n\n" + updated[0].Content
+		return append(updated, chat.Message{Role: "user", Content: instruction})
+	}
+	updated := append([]chat.Message{{Role: "system", Content: instruction}}, messages...)
+	return append(updated, chat.Message{Role: "user", Content: instruction})
 }
 
 func (l *ToolLoop) prepareTruncatedRetry(ctx context.Context, messages []chat.Message) ([]chat.Message, error) {
