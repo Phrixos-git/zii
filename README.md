@@ -176,6 +176,17 @@ Zii handles `SIGTERM` and allows up to 60 seconds for in-flight requests and the
 
 ## Verify and troubleshoot
 
+### Repeatable LLM evaluation
+
+`go build -o bin/zii-eval ./cmd/zii-eval` builds the evaluation CLI. It runs
+YAML question sets through the production ToolLoop without Discord or the
+conversation database, records anomalies and timings, and writes JSON, CSV,
+and Markdown reports. Use fixed tool responses for repeatable comparisons or
+live Search MCP for integration checks. See [eval/README.md](eval/README.md)
+for profiles, warmup/repetitions, metrics, and the `compare` command.
+
+### Application checks
+
 Run the automated checks from the repository root:
 
 ```sh
