@@ -1,0 +1,20 @@
+# Example only. Copy this entry under `models:` in model_profiles.yaml after
+# replacing endpoint with the actual OpenAI-compatible gpt-oss server address.
+models:
+  gpt-oss-20b:
+    model: gpt-oss-20b
+    endpoint: http://127.0.0.1:28080
+    capabilities:
+      tools: true
+      reasoning: true
+      reasoning_content: true
+      reasoning_effort: true
+      thinking_budget: true
+      parallel_tool_calls: false
+    supported_reasoning_efforts:
+      - low
+      - medium
+      - high
+    defaults:
+      reasoning_effort: medium
+      thinking_budget_tokens: null

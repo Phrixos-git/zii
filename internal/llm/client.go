@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/Phrixos-git/zii/internal/chat"
@@ -34,6 +35,28 @@ type ToolDefinition struct {
 type Completion struct {
 	Message      chat.Message
 	FinishReason string
+	Usage        Usage
+}
+
+// ModelProfile returns the selected profile without exposing mutable client
+// state.
+func (c *Client) ModelProfile() ModelProfile {
+	if c == nil {
+		return ModelProfile{}
+	}
+	profile := c.profile
+	profile.SupportedReasoningEfforts = append([]string(nil), c.profile.SupportedReasoningEfforts...)
+	if c.profile.Defaults.ThinkingBudgetTokens != nil {
+		budget := *c.profile.Defaults.ThinkingBudgetTokens
+		profile.Defaults.ThinkingBudgetTokens = &budget
+	}
+	return profile
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // ChatOptions overrides generation parameters for one request. Zero values
@@ -57,11 +80,13 @@ type chatRequest struct {
 	Model             string         `json:"model"`
 	Messages          []chat.Message `json:"messages"`
 	Stream            bool           `json:"stream"`
+	Verbose           bool           `json:"verbose"`
+	ReturnTokens      bool           `json:"return_tokens"`
 	MaxTokens         int            `json:"max_tokens"`
-	ReasoningEffort   string         `json:"reasoning_effort,omitempty"`
-	ThinkingBudget    int            `json:"thinking_budget_tokens,omitempty"`
-	ToolChoice        string         `json:"tool_choice"`
-	ParallelToolCalls bool           `json:"parallel_tool_calls"`
+	ReasoningEffort   *string        `json:"reasoning_effort,omitempty"`
+	ThinkingBudget    *int           `json:"thinking_budget_tokens,omitempty"`
+	ToolChoice        *string        `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
 	Tools             []requestTool  `json:"tools,omitempty"`
 }
 
@@ -74,6 +99,26 @@ type requestFunction struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
+}
+
+func logRequestProfile(profile ModelProfile, request chatRequest) {
+	effort := ""
+	if request.ReasoningEffort != nil {
+		effort = *request.ReasoningEffort
+	}
+	budget := 0
+	if request.ThinkingBudget != nil {
+		budget = *request.ThinkingBudget
+	}
+	slog.Debug("LLM request profile", "component", "llm", "event", "llm_request_profile",
+		"model", profile.Model, "model_profile", profile.ID,
+		"tools", len(request.Tools) > 0,
+		"reasoning", profile.Capabilities.Reasoning,
+		"reasoning_content", profile.Capabilities.ReasoningContent,
+		"reasoning_effort_capability", profile.Capabilities.ReasoningEffort,
+		"thinking_budget_capability", profile.Capabilities.ThinkingBudget,
+		"parallel_tool_calls", profile.Capabilities.ParallelToolCalls,
+		"reasoning_effort", effort, "thinking_budget_tokens", budget)
 }
 
 // Chat requests one non-streaming completion from the configured endpoint.
@@ -103,48 +148,100 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 	if toolChoice != "" && toolChoice != "auto" && toolChoice != "none" {
 		return Completion{}, errors.New("llm: tool choice override must be auto or none")
 	}
-	if toolChoice == "" {
+	if toolChoice == "" && c.profile.Capabilities.Tools {
 		toolChoice = "auto"
 	}
 	reasoningEffort := strings.TrimSpace(options.ReasoningEffort)
+	if reasoningEffort == "" {
+		reasoningEffort = c.reasoningEffort
+	}
 	if options.ReasoningEffort != "" && reasoningEffort == "" {
 		return Completion{}, errors.New("llm: reasoning effort override must not be blank")
+	}
+	if c.profile.Capabilities.ReasoningEffort && reasoningEffort != "" {
+		supported := false
+		for _, value := range c.profile.SupportedReasoningEfforts {
+			if reasoningEffort == value {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return Completion{}, fmt.Errorf("llm: reasoning effort %q is not supported by model profile %q", reasoningEffort, c.profile.ID)
+		}
 	}
 	maxTokens := c.maxTokens
 	if options.MaxTokens > 0 {
 		maxTokens = options.MaxTokens
 	}
+	thinkingBudget := options.ThinkingBudgetTokens
+	if thinkingBudget == 0 {
+		thinkingBudget = c.thinkingBudgetTokens
+	}
+	capabilities := c.profile.Capabilities
+	requestMessages := messages
+	if !capabilities.ReasoningContent {
+		requestMessages = append([]chat.Message(nil), messages...)
+		for i := range requestMessages {
+			requestMessages[i].ReasoningContent = ""
+		}
+	}
 	request := chatRequest{
-		Model:             c.model,
-		Messages:          messages,
-		Stream:            false,
-		MaxTokens:         maxTokens,
-		ReasoningEffort:   reasoningEffort,
-		ThinkingBudget:    options.ThinkingBudgetTokens,
-		ToolChoice:        toolChoice,
-		ParallelToolCalls: false,
+		Model:        c.model,
+		Messages:     requestMessages,
+		Stream:       false,
+		Verbose:      true,
+		ReturnTokens: true,
+		MaxTokens:    maxTokens,
 	}
-	for _, tool := range tools {
-		if strings.TrimSpace(tool.Name) == "" {
-			return Completion{}, fmt.Errorf("llm: tool name must not be empty")
-		}
-		parameters := strings.TrimSpace(string(tool.Parameters))
-		if parameters == "" || !json.Valid([]byte(parameters)) || parameters[0] != '{' {
-			return Completion{}, fmt.Errorf("llm: tool %q parameters must be a JSON Schema object", tool.Name)
-		}
-		request.Tools = append(request.Tools, requestTool{
-			Type: "function",
-			Function: requestFunction{
-				Name:        tool.Name,
-				Description: tool.Description,
-				Parameters:  json.RawMessage(parameters),
-			},
-		})
+	if capabilities.Reasoning && capabilities.ReasoningEffort && reasoningEffort != "" {
+		request.ReasoningEffort = &reasoningEffort
 	}
+	if capabilities.Reasoning && capabilities.ThinkingBudget && thinkingBudget > 0 {
+		request.ThinkingBudget = &thinkingBudget
+	}
+	if capabilities.Tools {
+		request.ToolChoice = &toolChoice
+		parallel := capabilities.ParallelToolCalls
+		request.ParallelToolCalls = &parallel
+	}
+	if capabilities.Tools {
+		for _, tool := range tools {
+			if strings.TrimSpace(tool.Name) == "" {
+				return Completion{}, fmt.Errorf("llm: tool name must not be empty")
+			}
+			parameters := strings.TrimSpace(string(tool.Parameters))
+			if parameters == "" || !json.Valid([]byte(parameters)) || parameters[0] != '{' {
+				return Completion{}, fmt.Errorf("llm: tool %q parameters must be a JSON Schema object", tool.Name)
+			}
+			request.Tools = append(request.Tools, requestTool{
+				Type: "function",
+				Function: requestFunction{
+					Name:        tool.Name,
+					Description: tool.Description,
+					Parameters:  json.RawMessage(parameters),
+				},
+			})
+		}
+	}
+	logRequestProfile(c.profile, request)
 	body, err := json.Marshal(request)
 	if err != nil {
 		return Completion{}, fmt.Errorf("llm: encode chat request: %w", err)
 	}
+	diagnostics, diagnosticsAvailable := toolLoopDiagnosticsFromContext(ctx)
+	var toolsDisabled *bool
+	if diagnosticsAvailable {
+		toolsDisabled = &diagnostics.ToolsDisabled
+	}
+	sentToolChoice := "omitted"
+	if request.ToolChoice != nil {
+		sentToolChoice = *request.ToolChoice
+	}
+	slog.Debug("LLM request metadata", "component", "llm", "event", "llm_request_metadata",
+		"request_id", requestIDFromContext(ctx), "inference_turn", diagnostics.InferenceTurn,
+		"tool_definition_count", len(request.Tools), "tool_choice", sentToolChoice,
+		"tools_disabled", toolsDisabled, "tools_disabled_reason", diagnostics.ToolsDisabledReason)
 	responseBody, err := c.postJSON(ctx, "/v1/chat/completions", body)
 	if err != nil {
 		return Completion{}, err
@@ -154,6 +251,8 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 			Message      chat.Message `json:"message"`
 			FinishReason *string      `json:"finish_reason"`
 		} `json:"choices"`
+		Usage   Usage           `json:"usage"`
+		Verbose json.RawMessage `json:"__verbose"`
 	}
 	if err := json.Unmarshal(responseBody, &response); err != nil {
 		return Completion{}, fmt.Errorf("%w: decode response: %v", ErrResponse, err)
@@ -162,6 +261,27 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 		return Completion{}, fmt.Errorf("%w: expected one choice with a finish_reason", ErrResponse)
 	}
 	choice := response.Choices[0]
+	slog.Debug("LLM response metadata", "component", "llm", "event", "llm_response_metadata",
+		"request_id", requestIDFromContext(ctx),
+		"inference_turn", diagnostics.InferenceTurn,
+		"finish_reason", *choice.FinishReason,
+		"completion_tokens", response.Usage.CompletionTokens,
+		"content_empty", strings.TrimSpace(choice.Message.Content) == "",
+		"reasoning_content_present", strings.TrimSpace(choice.Message.ReasoningContent) != "",
+		"tool_call_count", len(choice.Message.ToolCalls))
+	var sentTools []ToolDefinition
+	if capabilities.Tools {
+		sentTools = tools
+	}
+	logRawResponseMetadata(ctx, response.Verbose, strings.TrimSpace(choice.Message.Content) == "", sentTools...)
+	if !capabilities.ReasoningContent {
+		choice.Message.ReasoningContent = ""
+	}
+	if choice.Message.Role == "" {
+		// llama.cpp omits role in some OpenAI-compatible Chat Completions
+		// responses; the enclosing choice is an assistant completion.
+		choice.Message.Role = "assistant"
+	}
 	if choice.Message.Role != "assistant" {
 		return Completion{}, fmt.Errorf("%w: expected assistant message", ErrResponse)
 	}
@@ -170,21 +290,31 @@ func (c *Client) ChatWithOptions(ctx context.Context, messages []chat.Message, t
 		if len(choice.Message.ToolCalls) != 0 {
 			return Completion{}, fmt.Errorf("%w: stop response contains tool calls", ErrResponse)
 		}
-		return Completion{Message: choice.Message, FinishReason: "stop"}, nil
+		return Completion{Message: choice.Message, FinishReason: "stop", Usage: response.Usage}, nil
 	case "tool_calls":
-		if len(choice.Message.ToolCalls) != 1 {
-			return Completion{}, fmt.Errorf("%w: expected exactly one tool call", ErrResponse)
+		if !capabilities.Tools || len(choice.Message.ToolCalls) == 0 {
+			return Completion{}, fmt.Errorf("%w: tool calls are not enabled", ErrResponse)
 		}
-		call := &choice.Message.ToolCalls[0]
-		if strings.TrimSpace(call.ID) == "" || call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
-			return Completion{}, fmt.Errorf("%w: tool call is missing id, function type, or name", ErrResponse)
+		if len(choice.Message.ToolCalls) > 1 && !capabilities.ParallelToolCalls {
+			return Completion{}, fmt.Errorf("%w: model profile does not allow multiple tool calls", ErrResponse)
 		}
-		arguments, err := call.Function.NormalizedArguments()
-		if err != nil {
-			return Completion{}, fmt.Errorf("%w: %v", ErrInvalidArguments, err)
+		seenIDs := make(map[string]struct{}, len(choice.Message.ToolCalls))
+		for i := range choice.Message.ToolCalls {
+			call := &choice.Message.ToolCalls[i]
+			if strings.TrimSpace(call.ID) == "" || call.Type != "function" || strings.TrimSpace(call.Function.Name) == "" {
+				return Completion{}, fmt.Errorf("%w: tool call is missing id, function type, or name", ErrResponse)
+			}
+			if _, duplicate := seenIDs[call.ID]; duplicate {
+				return Completion{}, fmt.Errorf("%w: duplicate tool call id", ErrResponse)
+			}
+			seenIDs[call.ID] = struct{}{}
+			arguments, err := call.Function.NormalizedArguments()
+			if err != nil {
+				return Completion{}, fmt.Errorf("%w: %v", ErrInvalidArguments, err)
+			}
+			call.Function.Arguments = arguments
 		}
-		call.Function.Arguments = arguments
-		return Completion{Message: choice.Message, FinishReason: "tool_calls"}, nil
+		return Completion{Message: choice.Message, FinishReason: "tool_calls", Usage: response.Usage}, nil
 	case "length":
 		return Completion{}, ErrTruncated
 	default:
