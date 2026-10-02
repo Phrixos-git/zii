@@ -1,5 +1,9 @@
 package orchestrator
 
+// DefaultSystemPrompt exposes the runtime prompt to evaluation clients without
+// maintaining a second copy that could drift from the Discord application.
+func DefaultSystemPrompt() string { return defaultSystemPrompt }
+
 // defaultSystemPrompt deliberately contains no runtime credentials or
 // deployment secrets. User messages, conversation history, and search results
 // remain separate messages and are treated as untrusted content.

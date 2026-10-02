@@ -1,0 +1,95 @@
+version: 1
+cases:
+  - id: fixture_local
+    category: tool-search
+    modes: [fixture]
+    prompt: "保存済みページをsearch_localで検索して、テスト用の架空計画Project Torchの公開予定日をYYYY-MM-DD形式で答えてください。"
+    expect:
+      min_tool_calls: 1
+      required_tools: [search_local]
+      contains: ["2026-11-15"]
+    fixtures:
+      search_local:
+        - data:
+            results:
+              - title: Project Torch 計画
+                url: https://example.invalid/torch
+                snippet: "公開予定日は2026-11-15です。これは固定のテストデータです。"
+  - id: fixture_web
+    category: tool-search
+    modes: [fixture]
+    prompt: "search_webを使用して、テスト用の架空製品EvalBeaconの2026-10-01時点の最新バージョンを調べてください。回答に参照URLも含めてください。"
+    expect:
+      min_tool_calls: 1
+      required_tools: [search_web]
+      contains: ["2.4.1", "https://example.invalid/beacon/releases"]
+    fixtures:
+      search_local:
+        - data: {results: []}
+      search_web:
+        - data:
+            results:
+              - title: EvalBeacon releases
+                url: https://example.invalid/beacon/releases
+                snippet: "2026-10-01の最新バージョンは2.4.1です。"
+      fetch_page:
+        - match: {url: "https://example.invalid/beacon/releases"}
+          data:
+            result: {url: "https://example.invalid/beacon/releases", title: EvalBeacon releases, content: "2026-10-01の最新バージョンは2.4.1です。"}
+  - id: fixture_fetch
+    category: tool-search
+    modes: [fixture]
+    prompt: "fetch_pageで https://example.invalid/eval/policy を取得し、本文にある保存期間を答えてください。"
+    expect:
+      min_tool_calls: 1
+      required_tools: [fetch_page]
+      contains: ["30日"]
+    fixtures:
+      fetch_page:
+        - match: {url: "https://example.invalid/eval/policy"}
+          data:
+            result:
+              url: https://example.invalid/eval/policy
+              title: Evaluation policy
+              content: "評価用データの保存期間は30日です。期間終了後は削除します。"
+  - id: fixture_three_tools
+    category: multi-tool
+    modes: [fixture]
+    prompt: "架空製品Auroraの連携機能について、まずsearch_localで確認し、なければsearch_webで公式ページを探し、最後にfetch_pageで本文を読んでください。本文に記載された接続数上限と対応形式を答えてください。"
+    expect:
+      min_tool_calls: 3
+      max_tool_calls: 3
+      required_tools: [search_local, search_web, fetch_page]
+      contains: ["16", "JSON"]
+    fixtures:
+      search_local:
+        - data: {results: []}
+      search_web:
+        - data:
+            results:
+              - title: Aurora integration specification
+                url: https://example.invalid/aurora/integration
+                snippet: "接続数上限と対応形式の詳細は本文を確認してください。"
+      fetch_page:
+        - match: {url: "https://example.invalid/aurora/integration"}
+          data:
+            result:
+              url: https://example.invalid/aurora/integration
+              title: Aurora integration specification
+              content: "同時接続数の上限は16です。連携データの対応形式はJSONです。"
+  - id: live_web_search
+    category: live-tool
+    modes: [live]
+    prompt: "search_webを使ってGo言語の公式サイトを検索し、公式URLを1つ示してください。"
+    expect:
+      min_tool_calls: 1
+      required_tools: [search_web]
+      contains: ["https://go.dev"]
+  - id: live_fetch_page
+    category: live-tool
+    modes: [live]
+    prompt: "fetch_pageで https://go.dev/doc/ を取得し、Goという言語名を含めて、このページで案内されている内容を日本語で短く説明してください。"
+    expect:
+      min_tool_calls: 1
+      required_tools: [fetch_page]
+      contains: ["Go"]

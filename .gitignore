@@ -29,3 +29,8 @@ coverage/
 /dist/
 *.test
 coverage.out
+
+# Evaluation outputs and machine-specific profiles
+/reports/
+/zii-eval
+/eval/profiles/local*.yaml
