@@ -12,7 +12,43 @@ models:
     # The live Qwen endpoint was verified with medium. Add other values only
     # after confirming that the selected model/template accepts them.
     supported_reasoning_efforts:
+      - low
       - medium
+      - xhigh
     defaults:
-      reasoning_effort: medium
+      reasoning_effort: xhigh
       thinking_budget_tokens: 2048
+  gpt-oss-20b:
+    model: gpt-oss-20b
+    endpoint: http://127.0.0.1:28080
+    capabilities:
+      tools: true
+      reasoning: true
+      reasoning_content: true
+      reasoning_effort: true
+      thinking_budget: true
+      parallel_tool_calls: false
+    supported_reasoning_efforts:
+      - low
+      - medium
+      - high
+    defaults:
+      reasoning_effort: high
+      thinking_budget_tokens: null
+  ministral-3-14b-instruct-2512:
+    # Ministral 3 14B Instruct. Match model to the server's /v1/models ID
+    # (or start the server with the ministral-14b alias).
+    model: ministral-14b
+    endpoint: http://127.0.0.1:28081
+    capabilities:
+      tools: true
+      reasoning: false
+      reasoning_content: false
+      reasoning_effort: false
+      thinking_budget: false
+      # Enable only after verifying support in the serving runtime.
+      parallel_tool_calls: false
+    supported_reasoning_efforts: []
+    defaults:
+      reasoning_effort: ""
+      thinking_budget_tokens: null

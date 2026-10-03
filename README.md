@@ -106,6 +106,7 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 | `REQUEST_QUEUE_SIZE` | `10` | Maximum number of queued Discord requests. |
 | `QUEUE_WAIT_TIMEOUT` | `180s` | Maximum time a request waits in the queue. |
 | `REQUEST_TIMEOUT` | `300s` | Maximum processing time for one request. |
+| `APP_TIMEZONE` | `Asia/Tokyo` | Timezone used for relative date and time answers. |
 | `DISCORD_REPLY_MAX_CHARS` | `1900` | Maximum characters per Discord reply chunk; must not exceed 2000. |
 | `DISCORD_SEND_MAX_RETRIES` | `3` | Maximum retry count for sending a reply. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error`. Unknown values use `info`. |
@@ -113,6 +114,8 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 `LLM_REASONING_EFFORT` and `LLM_THINKING_BUDGET_TOKENS` optionally override the selected profile's defaults. An effort value must appear in that profile's `supported_reasoning_efforts` list. A zero budget means “use the profile default”; set the YAML value to `null` for no default budget. Each value is sent only when both `reasoning` and its corresponding `reasoning_effort` or `thinking_budget` capability are enabled. A disabled capability causes the field to be omitted even when an environment override or profile default is present.
 
 Duration values use Go duration syntax such as `30s`, `5m`, or `168h`. Numeric environment limits must be positive integers. `DISCORD_SEND_MAX_RETRIES` accepts values from `1` through `10`.
+
+Relative date and time answers refer to the Discord message creation time in `APP_TIMEZONE`. The default is `Asia/Tokyo`; `UTC` and IANA names are allowed. `Local` and invalid names abort startup. Zii does not use web search for the date or time itself.
 
 ## Start in the foreground
 

@@ -55,6 +55,7 @@ type Service struct {
 	context    *ContextBuilder
 	toolLoop   *ToolLoop
 	system     string
+	location   *time.Location
 	clock      func() time.Time
 }
 
@@ -62,6 +63,7 @@ type ServiceConfig struct {
 	SystemPrompt     string
 	MaxHistoryTurns  int
 	MaxHistoryTokens int
+	Timezone         string
 	Clock            func() time.Time
 }
 
@@ -83,6 +85,10 @@ func NewService(repository Repository, client ChatClient, toolLoop *ToolLoop, cf
 	if maxTokens == 0 {
 		maxTokens = maxHistoryTokenLimit
 	}
+	location, err := LoadRuntimeTimezone(cfg.Timezone)
+	if err != nil {
+		return nil, err
+	}
 	contextBuilder, err := NewContextBuilder(client, maxTurns, maxTokens)
 	if err != nil {
 		return nil, err
@@ -95,7 +101,7 @@ func NewService(repository Repository, client ChatClient, toolLoop *ToolLoop, cf
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{repository: repository, context: contextBuilder, toolLoop: toolLoop, system: systemPrompt, clock: clock}, nil
+	return &Service{repository: repository, context: contextBuilder, toolLoop: toolLoop, system: systemPrompt, location: location, clock: clock}, nil
 }
 
 // Process persists the accepted user message, builds its context, and returns
@@ -130,7 +136,8 @@ func (s *Service) Process(ctx context.Context, request Request) (Reply, error) {
 	if err != nil {
 		return Reply{}, fmt.Errorf("orchestrator: load conversation history: %w", err)
 	}
-	messages, err := s.context.Build(ctx, s.system, request.Content, history)
+	system := s.system + "\n\n" + runtimeContext(request.MessageCreatedAt, s.location)
+	messages, err := s.context.Build(ctx, system, request.Content, history)
 	if err != nil {
 		return Reply{}, err
 	}
