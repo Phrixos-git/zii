@@ -24,7 +24,7 @@ Discord BotからLocal LLMを利用し、以下を実現する。
 - 直近のConversation履歴をLLM Contextへ渡す
 - LLMが必要と判断した場合のみSearch MCPを利用する
 - Search MCPの結果をLLMへ再投入する
-- Queue受付後に受付Replyを送り、最終回答は受付ReplyをEditして返す
+- Queue実行開始時に質問IDをDBへ原子的に登録・Commitしてから受付Replyを送り、最終回答は受付ReplyをEditして返す
 - 必要な場合は回答後の行動・判断材料も提示する
 
 ## 現在の構成
@@ -144,7 +144,7 @@ Conversation Key
     → Orchestrator内部で履歴を関連付ける
 ```
 
-BotはQueue受付後に元のUser MessageへのProcessing Replyを送り、最終回答はそのMessageをEditして表示する。長文の追加chunkは元のUser MessageへのReplyとして送信する。
+BotはQueue実行開始時にUser Messageと質問IDを原子的にSQLiteへ登録・Commitし、登録に成功した処理だけが元のUser MessageへのProcessing Replyを送る。最終回答はそのMessageをEditして表示する。長文の追加chunkは元のUser MessageへのReplyとして送信する。
 
 ### SQLite
 
@@ -233,7 +233,8 @@ INDEX
 				```
 			- User MessageをSQLiteへ保存
 				```text
-				BEGIN
+				BEGIN IMMEDIATE
+				重複discord_message_id確認
 				Active Conversation取得
 			    または
 				Conversation新規作成
@@ -326,6 +327,8 @@ INDEX
 				│ last_active_at更新      │
 				└─────────────────────────┘
 		        ↓ COMMIT
+				Processing Reply送信（登録成功した処理のみ）
+		        ↓
 				Context Builder
 		        ↓
 				過去最大5ターン / 8K tokens
@@ -983,7 +986,8 @@ max_tokens = 1536
 
 - 通常Requestは既定の`max_tokens=4096`を使い、`reasoning_effort`と`thinking_budget_tokens`を送らない。
 - Discord AdapterはOrchestratorの検出を通過した後も、最終出力にtool-call記法が残っていないか送信・保存前に検査する。一致した場合は最終回答を配信・SQLite保存せず、既定のエラー応答にする。
-- Request Queueへの登録成功後、Discord AdapterはLLM処理前に元User MessageへのProcessing Replyを送る。送信に失敗した場合はOrchestrator処理を開始しない。
+- Request Queueへの登録成功後、会話単位の実行順を待つ。実行開始時にUser Messageと質問IDをSQLiteへ原子的に登録・Commitし、成功した処理だけが元User MessageへのProcessing Replyを送る。重複・DB登録失敗ではProcessing ReplyとLLM処理を行わない。送信に失敗した場合もLLM処理を開始しない。
+- Commit済みUser Messageは後続処理の失敗でも削除しない。同じ質問IDの再受信は無視し、再試行は新しい質問Messageで行う。
 - 最終回答確定後、Discord Adapterへ：
 
 ```
@@ -1056,7 +1060,7 @@ COMMIT
 ```
 
 - `UNIQUE(discord_message_id)`を最終的な重複防止として利用。
-- LLM / MCP処理はCommit後。
+- Processing Reply送信とLLM / MCP処理はCommit後。会話単位のQueue実行中に登録・送信・回答生成・配信を行い、後続質問の登録が先行回答のAssistant保存より先にならないようにする。
 - Assistant側：
 
 ```

@@ -37,6 +37,11 @@ func run() error {
 	if dbPath == "" || !filepath.IsAbs(dbPath) {
 		return errors.New("BOT_DB_PATH must be an absolute path")
 	}
+	location, err := orchestrator.LoadRuntimeTimezone(os.Getenv("APP_TIMEZONE"))
+	if err != nil {
+		return err
+	}
+	timezoneName := location.String()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	db, err := storage.OpenSQLite(ctx, dbPath)
@@ -130,7 +135,7 @@ func run() error {
 		_ = db.Close()
 		return err
 	}
-	service, err := orchestrator.NewService(repository, llmClient, loop, orchestrator.ServiceConfig{MaxHistoryTurns: maxTurns, MaxHistoryTokens: maxTokens})
+	service, err := orchestrator.NewService(repository, llmClient, loop, orchestrator.ServiceConfig{MaxHistoryTurns: maxTurns, MaxHistoryTokens: maxTokens, Timezone: timezoneName})
 	if err != nil {
 		_ = searchClient.Close()
 		_ = db.Close()
