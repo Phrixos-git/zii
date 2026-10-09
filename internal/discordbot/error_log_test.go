@@ -25,7 +25,7 @@ func TestRequestFailureLogsCauseAndKeepsGenericDiscordReply(t *testing.T) {
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
-	p := &processorFake{admissionErr: fmt.Errorf("orchestrator: check duplicate Discord message: %w", databaseLogError{})}
+	p := &processorFake{admissionErr: fmt.Errorf("orchestrator: persist user message: %w", databaseLogError{})}
 	s := &senderFake{}
 	a, err := New(p, testQueue(t), s, Config{})
 	if err != nil {
@@ -43,7 +43,7 @@ func TestRequestFailureLogsCauseAndKeepsGenericDiscordReply(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
 		t.Fatal(err)
 	}
-	if entry.Event != "request_failed" || entry.Code != "request_failed" || entry.Detail.Code != 5 || !strings.Contains(entry.Detail.Message, "check duplicate Discord message") || !strings.Contains(entry.Detail.Message, "SQLITE_BUSY") {
+	if entry.Event != "request_failed" || entry.Code != "request_failed" || entry.Detail.Code != 5 || !strings.Contains(entry.Detail.Message, "persist user message") || !strings.Contains(entry.Detail.Message, "SQLITE_BUSY") {
 		t.Fatalf("missing diagnostic fields: %s", logs.String())
 	}
 	if len(s.replies) != 1 || s.replies[0] != processingErrorText || strings.Contains(logs.String(), "private question") {

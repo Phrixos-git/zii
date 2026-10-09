@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,17 +19,12 @@ type serviceRepo struct {
 	history        []storage.HistoryMessage
 	conversationID string
 	userCalls      int
-	duplicate      bool
-	duplicateErr   error
 	assistant      *storage.AssistantMessage
 	userErr        error
 	historyErr     error
 	assistantErr   error
 }
 
-func (r *serviceRepo) HasDiscordMessage(context.Context, string) (bool, error) {
-	return r.duplicate, r.duplicateErr
-}
 func (r *serviceRepo) RecordUserMessage(_ context.Context, in storage.UserMessage, now time.Time) (string, error) {
 	r.userCalls++
 	r.user, r.now = in, now
@@ -133,7 +130,7 @@ func TestServiceReturnsErrorsWithoutPersistingAssistant(t *testing.T) {
 }
 
 func TestProcessQueuedWithAcceptedRejectsDuplicateBeforeAcceptance(t *testing.T) {
-	repo := &serviceRepo{conversationID: "c", duplicate: true}
+	repo := &serviceRepo{conversationID: "c", userErr: storage.ErrDuplicateDiscordMessage}
 	client := &serviceChat{result: "must not run"}
 	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
 	service, err := NewService(repo, client, loop, ServiceConfig{})
@@ -151,7 +148,7 @@ func TestProcessQueuedWithAcceptedRejectsDuplicateBeforeAcceptance(t *testing.T)
 		accepted = true
 		return nil
 	}, nil)
-	if !errors.Is(err, storage.ErrDuplicateDiscordMessage) || accepted || repo.userCalls != 0 || len(client.requests) != 0 {
+	if !errors.Is(err, storage.ErrDuplicateDiscordMessage) || accepted || repo.userCalls != 1 || len(client.requests) != 0 {
 		t.Fatalf("duplicate err=%v accepted=%t userCalls=%d llmCalls=%d", err, accepted, repo.userCalls, len(client.requests))
 	}
 }
@@ -205,7 +202,7 @@ func TestProcessQueuedWithAcceptedRejectsWhitespaceGuildIDBeforeAcceptance(t *te
 	}
 }
 
-func TestProcessQueuedWithAcceptedRunsBeforeOrchestrationAndStopsOnError(t *testing.T) {
+func TestProcessQueuedWithAcceptedCommitsBeforeReceiptAndStopsOnReceiptError(t *testing.T) {
 	for _, failAdmission := range []bool{false, true} {
 		repo := &serviceRepo{conversationID: "c"}
 		client := &serviceChat{result: "answer"}
@@ -223,8 +220,8 @@ func TestProcessQueuedWithAcceptedRunsBeforeOrchestrationAndStopsOnError(t *test
 		admitted := false
 		err = service.ProcessQueuedWithAccepted(context.Background(), queue, request, func(context.Context) error {
 			admitted = true
-			if repo.userCalls != 0 || len(client.requests) != 0 {
-				t.Fatal("orchestration started before acceptance callback")
+			if repo.userCalls != 1 || len(client.requests) != 0 {
+				t.Error("question was not stored exactly once before receipt, or LLM started early")
 			}
 			if failAdmission {
 				return admissionErr
@@ -236,11 +233,146 @@ func TestProcessQueuedWithAcceptedRunsBeforeOrchestrationAndStopsOnError(t *test
 			t.Fatal("acceptance callback was not called")
 		}
 		if failAdmission {
-			if !errors.Is(err, admissionErr) || repo.userCalls != 0 || len(client.requests) != 0 {
+			if !errors.Is(err, admissionErr) || repo.userCalls != 1 || len(client.requests) != 0 {
 				t.Fatalf("failed admission err=%v userCalls=%d llmCalls=%d", err, repo.userCalls, len(client.requests))
 			}
 		} else if err != nil || repo.userCalls != 1 || len(client.requests) != 1 {
 			t.Fatalf("successful admission err=%v userCalls=%d llmCalls=%d", err, repo.userCalls, len(client.requests))
 		}
+	}
+}
+
+func TestProcessQueuedRegistrationFailureDoesNotSendReceiptOrCallLLM(t *testing.T) {
+	repo := &serviceRepo{userErr: errors.New("registration failed")}
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, _ := NewService(repo, client, loop, ServiceConfig{})
+	queue, _ := NewRequestQueue(QueueConfig{})
+	t.Cleanup(func() { _ = queue.Shutdown(context.Background()) })
+	accepted := false
+	request := Request{RequestID: "r", DiscordMessageID: "d", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	err := service.ProcessQueuedWithAccepted(context.Background(), queue, request, func(context.Context) error { accepted = true; return nil }, nil)
+	if !errors.Is(err, repo.userErr) || accepted || len(client.requests) != 0 {
+		t.Fatalf("err=%v accepted=%t llmCalls=%d", err, accepted, len(client.requests))
+	}
+}
+
+func TestConcurrentSQLiteRegistrationAllowsOnlyOneReceipt(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, filepath.Join(t.TempDir(), "zii.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	repo, _ := storage.NewRepository(db)
+	newService := func() *Service {
+		client := &serviceChat{result: "answer"}
+		loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+		service, _ := NewService(repo, client, loop, ServiceConfig{})
+		return service
+	}
+	first, second := newService(), newService()
+	q1, _ := NewRequestQueue(QueueConfig{})
+	q2, _ := NewRequestQueue(QueueConfig{})
+	t.Cleanup(func() { _ = q1.Shutdown(ctx); _ = q2.Shutdown(ctx) })
+	request := Request{RequestID: "r1", DiscordMessageID: "same-question", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	var receipts atomic.Int32
+	started, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		done <- first.ProcessQueuedWithAccepted(ctx, q1, request, func(context.Context) error {
+			receipts.Add(1)
+			close(started)
+			<-release
+			return nil
+		}, nil)
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("first request failed before receipt: %v", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE discord_message_id = ?`, request.DiscordMessageID).Scan(&count); err != nil || count != 1 {
+		t.Errorf("question was not committed before receipt: count=%d err=%v", count, err)
+	}
+	request.RequestID = "r2"
+	err = second.ProcessQueuedWithAccepted(ctx, q2, request, func(context.Context) error { receipts.Add(1); return nil }, nil)
+	close(release)
+	firstErr := <-done
+	if firstErr != nil || !errors.Is(err, storage.ErrDuplicateDiscordMessage) || receipts.Load() != 1 {
+		t.Fatalf("first=%v duplicate=%v receipts=%d", firstErr, err, receipts.Load())
+	}
+}
+
+func TestSQLiteBusyBeforeRegistrationPreventsReceipt(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, filepath.Join(t.TempDir(), "zii.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo, _ := storage.NewRepository(db)
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, _ := NewService(repo, client, loop, ServiceConfig{})
+	queue, _ := NewRequestQueue(QueueConfig{})
+	defer queue.Shutdown(ctx)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	accepted := false
+	request := Request{RequestID: "r", DiscordMessageID: "locked-question", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	err = service.ProcessQueuedWithAccepted(ctx, queue, request, func(context.Context) error { accepted = true; return nil }, nil)
+	var coded interface{ Code() int }
+	if !errors.As(err, &coded) || coded.Code()&0xff != 5 || accepted || len(client.requests) != 0 {
+		t.Fatalf("err=%v receipt=%t llmCalls=%d", err, accepted, len(client.requests))
+	}
+}
+
+func TestSQLiteReceiptFailureKeepsQuestionRegistered(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, filepath.Join(t.TempDir(), "zii.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo, _ := storage.NewRepository(db)
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, _ := NewService(repo, client, loop, ServiceConfig{})
+	queue, _ := NewRequestQueue(QueueConfig{})
+	defer queue.Shutdown(ctx)
+	request := Request{RequestID: "r", DiscordMessageID: "same-question", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	failure := errors.New("receipt send failed")
+	receipts := 0
+	accepted := func(context.Context) error { receipts++; return failure }
+	if err := service.ProcessQueuedWithAccepted(ctx, queue, request, accepted, nil); !errors.Is(err, failure) {
+		t.Fatal(err)
+	}
+	if err := service.ProcessQueuedWithAccepted(ctx, queue, request, accepted, nil); !errors.Is(err, storage.ErrDuplicateDiscordMessage) {
+		t.Fatalf("duplicate after receipt failure: %v", err)
+	}
+	if receipts != 1 || len(client.requests) != 0 {
+		t.Fatalf("receipts=%d llmCalls=%d", receipts, len(client.requests))
+	}
+}
+
+func TestClosedQueueDoesNotRegisterQuestionOrSendReceipt(t *testing.T) {
+	repo := &serviceRepo{conversationID: "c"}
+	client := &serviceChat{result: "must not run"}
+	loop, _ := NewToolLoop(client, &fakeLoopSearch{}, newTestRegistry(t))
+	service, _ := NewService(repo, client, loop, ServiceConfig{})
+	queue, _ := NewRequestQueue(QueueConfig{})
+	ctx := context.Background()
+	if err := queue.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	request := Request{RequestID: "r", DiscordMessageID: "d", ChannelID: "ch", UserID: "u", Content: "q", MessageCreatedAt: time.Now(), ReceivedAt: time.Now()}
+	accepted := false
+	err := service.ProcessQueuedWithAccepted(ctx, queue, request, func(context.Context) error { accepted = true; return nil }, nil)
+	if !errors.Is(err, ErrQueueClosed) || repo.userCalls != 0 || accepted || len(client.requests) != 0 {
+		t.Fatalf("err=%v userCalls=%d receipt=%t llmCalls=%d", err, repo.userCalls, accepted, len(client.requests))
 	}
 }

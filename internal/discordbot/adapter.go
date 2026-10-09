@@ -165,6 +165,7 @@ func (a *Adapter) Handle(ctx context.Context, msg Incoming, botID string) {
 		return
 	}
 	request := orchestrator.Request{RequestID: requestID, DiscordMessageID: msg.ID, GuildID: nullable(msg.GuildID), ChannelID: msg.ChannelID, ThreadID: msg.ThreadID, UserID: msg.UserID, Content: msg.Content, MessageCreatedAt: msg.CreatedAt.UTC(), ReceivedAt: msg.ReceivedAt.UTC()}
+	ctx = context.WithValue(ctx, discordRequestIDKey{}, requestID)
 	replyChannelID := msg.ChannelID
 	if msg.ThreadID != "" {
 		replyChannelID = msg.ThreadID
@@ -282,6 +283,7 @@ func (a *Adapter) sendChunks(ctx context.Context, replyTo, channelID, text strin
 }
 
 func (a *Adapter) sendWithRetry(ctx context.Context, replyTo, channelID, content string) (SentMessage, error) {
+	ctx = withDiscordHTTPAttempt(ctx, "reply")
 	var sent SentMessage
 	err := a.retryDiscord(ctx, func() error {
 		var err error
@@ -298,6 +300,7 @@ func (a *Adapter) sendWithRetry(ctx context.Context, replyTo, channelID, content
 }
 
 func (a *Adapter) editWithRetry(ctx context.Context, channelID, messageID, content string) error {
+	ctx = withDiscordHTTPAttempt(ctx, "edit")
 	return a.retryDiscord(ctx, func() error {
 		return a.sender.Edit(ctx, channelID, messageID, content)
 	})

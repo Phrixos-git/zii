@@ -123,6 +123,8 @@ Run from the repository root. The process writes structured JSON logs to standar
 
 Discord request and delivery failures retain their existing `event` and `error_code` fields and add an `error_detail` object. It contains a redacted `message`, `type`, and `cause_type`, plus `http_status`, `discord_code`, `cause_code` (for example, SQLite code 5), or `context_error` when available. Use `request_id` to correlate failures with processing and final-answer events; `processing_message_id` on `request_failed` is empty if no receipt was recorded. Discord still receives only the generic error text. Configured sensitive values and recognized sensitive patterns are redacted, Discord API response bodies are omitted, and diagnostic messages are limited to 2048 characters plus a truncation marker.
 
+With `LOG_LEVEL=DEBUG`, each Discord message HTTP attempt emits `event=discord_http_attempt`. `send_count` starts at 1 for each reply or edit and includes both DiscordGo internal retries and adapter retries. Correlate attempts with `request_id` and `delivery_id`; each chunk or edit has its own `delivery_id`. Logs include `operation`, `method`, `http_status`, `transport_error`, and `duration_ms`. `http_status=0` means no HTTP response was received. Headers, URLs, bodies, tokens, and error text are not logged. These records describe HTTP attempts, not proof that Discord created a message.
+
 For development, run directly from source:
 
 ```sh
@@ -200,3 +202,5 @@ go vet ./...
 The tests use fake LLM, MCP, and Discord clients; they do not contact your runtime services. For live startup, confirm that the LLM server has loaded the model named by `LLM_MODEL` and that Search MCP is reachable at `SEARCH_MCP_URL`. If Zii exits before connecting to Discord, check its first startup error and confirm the required environment variables, database directory permissions, and Search MCP tool list.
 
 In Discord, Zii responds when mentioned in a server channel and to ordinary text messages in a DM. It ignores bot, webhook, and system messages. The bot must be able to view and send messages in the target channel; replies are sent as replies to the triggering message.
+
+When a queued request starts, Zii atomically stores the question's Discord message ID and user message in SQLite before sending the processing receipt. Only the request that commits this registration sends a receipt and generates an answer. Duplicate questions and failed registrations do not send a processing receipt or call the LLM. Queued requests wait for their turn before receiving a receipt, keeping conversation history and answer delivery ordered. A committed question stays registered even if receipt delivery or later processing fails; retry by posting a new question. Receipt and error messages are not stored as conversation messages.

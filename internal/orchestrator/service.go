@@ -12,7 +12,6 @@ import (
 
 // Repository is the persistence boundary used by the Orchestrator.
 type Repository interface {
-	HasDiscordMessage(context.Context, string) (bool, error)
 	RecordUserMessage(context.Context, storage.UserMessage, time.Time) (string, error)
 	LoadMessagesBefore(context.Context, string, string) ([]storage.HistoryMessage, error)
 	RecordAssistantMessage(context.Context, storage.AssistantMessage) error
@@ -107,6 +106,12 @@ func NewService(repository Repository, client ChatClient, toolLoop *ToolLoop, cf
 // Process persists the accepted user message, builds its context, and returns
 // a final answer for the Discord adapter. Assistant history is not saved here.
 func (s *Service) Process(ctx context.Context, request Request) (Reply, error) {
+	return s.processWithAccepted(ctx, request, nil)
+}
+
+// processWithAccepted commits the question before invoking the receipt callback.
+// The transaction is finished before any Discord, LLM, or MCP network operation.
+func (s *Service) processWithAccepted(ctx context.Context, request Request, accepted func(context.Context) error) (Reply, error) {
 	if s == nil || s.repository == nil || s.context == nil || s.toolLoop == nil {
 		return Reply{}, errors.New("orchestrator: service is not initialized")
 	}
@@ -131,6 +136,11 @@ func (s *Service) Process(ctx context.Context, request Request) (Reply, error) {
 	}, now)
 	if err != nil {
 		return Reply{}, fmt.Errorf("orchestrator: persist user message: %w", err)
+	}
+	if accepted != nil {
+		if err := accepted(ctx); err != nil {
+			return Reply{}, err
+		}
 	}
 	history, err := s.repository.LoadMessagesBefore(ctx, conversationID, request.DiscordMessageID)
 	if err != nil {
@@ -167,10 +177,9 @@ func (s *Service) ProcessQueuedWith(ctx context.Context, queue *RequestQueue, re
 	return s.ProcessQueuedWithAccepted(ctx, queue, request, nil, complete)
 }
 
-// ProcessQueuedWithAccepted is like ProcessQueuedWith but forwards accepted to
-// the request queue, where it runs after enqueue and before Service.Process.
-// The request is validated before the duplicate check and queue submission, so
-// accepted is not invoked for an invalid request.
+// ProcessQueuedWithAccepted holds the conversation key while registering the
+// question, sending its receipt, generating the answer, and delivering it.
+// Only a committed registration may invoke accepted; duplicates remain silent.
 func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQueue, request Request, accepted func(context.Context) error, complete func(context.Context, Reply) error) error {
 	if s == nil || s.repository == nil {
 		return errors.New("orchestrator: service is not initialized")
@@ -184,13 +193,6 @@ func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQ
 	if err := validateRequest(request); err != nil {
 		return err
 	}
-	duplicate, err := s.repository.HasDiscordMessage(ctx, request.DiscordMessageID)
-	if err != nil {
-		return fmt.Errorf("orchestrator: check duplicate Discord message: %w", err)
-	}
-	if duplicate {
-		return storage.ErrDuplicateDiscordMessage
-	}
 	scopeID := request.ChannelID
 	if strings.TrimSpace(request.ThreadID) != "" {
 		scopeID = request.ThreadID
@@ -200,9 +202,9 @@ func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQ
 		guildID = *request.GuildID
 	}
 	key := fmt.Sprintf("%d:%s%d:%s%d:%s", len(guildID), guildID, len(scopeID), scopeID, len(request.UserID), request.UserID)
-	err = queue.SubmitWithAccepted(ctx, key, accepted, func(workCtx context.Context) error {
+	return queue.Submit(ctx, key, func(workCtx context.Context) error {
 		workCtx = withRequestID(workCtx, request.RequestID)
-		reply, err := s.Process(workCtx, request)
+		reply, err := s.processWithAccepted(workCtx, request, accepted)
 		if err != nil {
 			return err
 		}
@@ -211,7 +213,6 @@ func (s *Service) ProcessQueuedWithAccepted(ctx context.Context, queue *RequestQ
 		}
 		return nil
 	})
-	return err
 }
 
 // RecordSuccessfulReply persists the answer only after the adapter confirms
