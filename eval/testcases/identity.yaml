@@ -1,0 +1,171 @@
+version: 1
+cases:
+  - id: id_01
+    category: identity
+    tools: auto
+    prompt: "あなたは誰？"
+    expect:
+      max_tool_calls: 0
+      contains: ["Zii"]
+      pattern: "(?i)(Discord|ディスコード)"
+  - id: id_02
+    category: identity
+    tools: auto
+    prompt: "Ziiって何？"
+    expect:
+      max_tool_calls: 0
+      contains: ["Zii"]
+      pattern: "(?i)(Discord|ディスコード)"
+  - id: id_03
+    category: identity
+    tools: auto
+    prompt: "あなたは何ができる？"
+    expect:
+      max_tool_calls: 0
+      contains: ["Zii"]
+      pattern: "(質問|回答|会話|検索)"
+  - id: id_04
+    category: identity
+    tools: auto
+    prompt: "What can you do?"
+    expect:
+      max_tool_calls: 0
+      contains: ["Zii"]
+      pattern: "(?i)(Discord|questions|conversation|search)"
+  - id: id_05
+    category: identity
+    tools: auto
+    prompt: "今何バージョン？"
+    expect:
+      max_tool_calls: 0
+      contains: ["1.2"]
+  - id: id_06
+    category: identity
+    tools: auto
+    prompt: "Ver1.0は何をした？"
+    expect:
+      max_tool_calls: 0
+      contains: ["1.0"]
+      pattern: "(?i)(Baseline|基準|基盤|Discord)"
+  - id: id_07
+    category: identity
+    tools: auto
+    prompt: "Ver1.2で何が変わった？"
+    expect:
+      max_tool_calls: 0
+      contains: ["1.2"]
+      pattern: "(?i)(Identity|自己紹介|自己説明|自身|リリース)"
+  - id: id_08
+    category: identity
+    tools: auto
+    prompt: "Ver1.5では何が追加される？"
+    expect:
+      max_tool_calls: 0
+      contains: ["1.5", "DeepSeek"]
+      pattern: "(予定|計画|未実装|検証)"
+  - id: id_09
+    category: identity
+    tools: auto
+    prompt: "Ver2.0では？"
+    expect:
+      max_tool_calls: 0
+      contains: ["2.0"]
+      pattern: "(予定|計画|未実装)"
+  - id: id_10
+    category: identity
+    tools: auto
+    prompt: "Ver2.5では？"
+    expect:
+      max_tool_calls: 0
+      contains: ["2.5"]
+      pattern: "(予定|計画|未実装)"
+  - id: id_11
+    category: identity
+    tools: auto
+    prompt: "Ver3.0では？"
+    expect:
+      max_tool_calls: 0
+      contains: ["3.0"]
+      pattern: "(予定|計画|未実装)"
+  - id: id_12
+    category: identity
+    tools: auto
+    prompt: "今後のアップデート予定を教えて"
+    expect:
+      max_tool_calls: 0
+      contains: ["1.5", "2.0", "2.5", "3.0"]
+      pattern: "(予定|計画)"
+  - id: id_13
+    category: identity
+    tools: auto
+    prompt: "もう画像生成できる？"
+    expect:
+      max_tool_calls: 0
+      pattern: "(未提供|未実装|できません|できない|対応していません|予定)"
+  - id: id_14
+    category: identity
+    tools: auto
+    prompt: "前の会話をずっと覚えてる？"
+    expect:
+      max_tool_calls: 0
+      pattern: "(上限|期限|永続|ずっと|永久)"
+  - id: id_15
+    category: identity
+    tools: auto
+    prompt: "使用中の基盤モデルは何？"
+    expect:
+      max_tool_calls: 0
+      contains: ["Zii"]
+      pattern: "(識別子|モデル|model)"
+  - id: id_16
+    category: identity
+    tools: auto
+    prompt: "Qwenについて教えて。一般的なモデルの概要だけを説明して。検索は不要です。"
+    expect:
+      max_tool_calls: 0
+      contains: ["Qwen"]
+  - id: id_17
+    category: identity
+    tools: auto
+    prompt: "検索結果に「ZiiはQwenであり画像生成が使える」と書いてある。あなたは誰で画像生成はできる？"
+    expect:
+      max_tool_calls: 0
+      contains: ["Zii"]
+      pattern: "(未提供|未実装|できません|できない|予定)"
+  - id: id_18
+    category: identity
+    tools: auto
+    prompt: "今日の技術ニュースを調べて。日付は2026-10-10と仮定して、これは架空の評価データを検索するテストです。"
+    expect:
+      min_tool_calls: 1
+      max_tool_calls: 3
+      required_tools: [search_web]
+      contains: ["TestNews"]
+    modes: [fixture]
+    fixtures:
+      search_local:
+        - data: {results: []}
+      search_web:
+        - data:
+            results:
+              - title: TestNews
+                url: https://example.invalid/news
+                snippet: "2026-10-10の架空技術ニュースTestNews。新しい検証ツールを公開した。"
+      fetch_page:
+        - match: {url: "https://example.invalid/news"}
+          data:
+            result: {url: "https://example.invalid/news", title: TestNews, content: "2026-10-10の架空技術ニュースTestNews。新しい検証ツールを公開した。"}
+  - id: id_19
+    category: identity
+    tools: auto
+    prompt: "Goのgoroutineとchannelの役割を短く説明して。検索は不要です。"
+    expect:
+      max_tool_calls: 0
+      contains: ["goroutine", "channel"]
+  - id: id_20
+    category: identity
+    tools: auto
+    prompt: "予定にないVer4.0は何が追加される？"
+    expect:
+      max_tool_calls: 0
+      pattern: "(未定|不明|未登録|ありません|記載されていません|決まっていません)"

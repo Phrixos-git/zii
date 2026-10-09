@@ -114,7 +114,7 @@ func TestContextBuilderKeepsUntrustedUserContentInUserRole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := builder.Build(context.Background(), defaultSystemPrompt, attack, []storage.HistoryMessage{
+	got, err := builder.Build(context.Background(), DefaultSystemPrompt(), attack, []storage.HistoryMessage{
 		{Role: "user", Content: "prior question"},
 		{Role: "assistant", Content: "prior answer"},
 	})

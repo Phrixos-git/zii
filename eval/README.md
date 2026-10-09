@@ -10,6 +10,7 @@
 | `testcases/tools.yaml` | 単一Tool、3段階Tool、実Search MCP |
 | `testcases/reasoning.yaml` | 計算、推論、長文からの抽出 |
 | `testcases/edge_cases.yaml` | 曖昧な質問、Unicode、Tool失敗、検索結果なし |
+| `testcases/identity.yaml` | Ziiの自己紹介、現在機能、リリース予定、基盤モデルとの区別、通常質問と検索の回帰 |
 | `profiles/example.yaml` | モデル、endpoint、生成設定、実行環境の記録 |
 | `../cmd/zii-eval` | check / run / compare コマンド |
 | `../internal/eval/runner.go` | 本番ToolLoopへの接続と反復実行 |
@@ -18,7 +19,17 @@
 | `../internal/eval/report.go`, `compare.go` | 結果保存と修正前後・モデル比較 |
 | `../reports/` | JSON・CSV・Markdown結果（Git管理外） |
 
-初期セットは23件です。`fixture`では21件を実行、`live`専用2件をSKIPします。`live`では通常質問と実検索2件を実行し、架空のURL・データを使う6件をSKIPします。各caseは独立し、履歴やfixtureの消費状態は次のcase・反復へ持ち越しません。
+セットは43件です。`fixture`では41件を実行、`live`専用2件をSKIPします。`live`では通常質問と実検索2件を実行し、架空のURL・データを使う7件をSKIPします。各caseは独立し、履歴やfixtureの消費状態は次のcase・反復へ持ち越しません。
+
+Ver1.2の20件は`--category identity`で選択できます。ID-01〜20を`id_01`〜`id_20`として収録しました。自己紹介とリリース問答は`tools: auto`でTool定義を渡したうえで呼び出し0回を検査します。`id_18`は日付を固定した架空のニュースをfixtureから取得し、通常の検索処理を確認します。これは実ニュースの検証ではありません。`id_15`の基盤モデル識別子、将来版の状態、過大な機能申告、開発元の混同などは保存した回答も目視で確認してください。正規表現のPASSだけでは意味の正確さを保証できません。
+
+```bash
+./bin/zii-eval run --profile eval/profiles/local.yaml \
+  --category identity --warmup 0 --runs 1 --save-answers \
+  --out reports/v1.2-identity
+```
+
+本番と評価は`orchestrator.BuildSystemPrompt`を共用し、埋め込んだ`internal/identity/manifest.yaml`から同じ情報を生成します。レポートの`system_prompt_sha256`には選択モデルと登録Toolを反映し、sampleにもその質問で実際に使ったPromptのハッシュを保存します。`tools: none`では検索不可となるためsampleのハッシュが変わります。Discord固有のメッセージ作成時刻のContextは評価では付与せず、時刻を必要とする質問には固定の仮定を使います。Manifest変更後は両バイナリを再ビルドしてください。
 
 ## 最初の実行
 
@@ -71,7 +82,7 @@ go build -o bin/zii-eval ./cmd/zii-eval
   --out reports/comparison
 ```
 
-warmupは**選択したセット全体を指定回数実行**し、測定集計から除外します。その後、同じ順序で`runs`回実行します。上の例ではfixture対象21問 × 4周 = 84問を実LLMへ送ります。1問数分かかる環境では、最初は`--warmup 0 --runs 1`、または`--id` / `--category`で絞ってください。
+warmupは**選択したセット全体を指定回数実行**し、測定集計から除外します。その後、同じ順序で`runs`回実行します。上の例ではfixture対象41問 × 4周 = 164問を実LLMへ送ります。1問数分かかる環境では、最初は`--warmup 0 --runs 1`、または`--id` / `--category`で絞ってください。
 
 比較時には質問・期待値・fixtureのSHA-256、Toolモード、回数、timeout、Tool上限、token計数方式、Tool定義、case選択条件の一致を必須とします。異なるセットや途中終了した結果を同じ条件の比較として扱いません。モデル・生成設定の差は比較レポートに列挙します。System Promptの変更も表示します。意図した差以外を揃えてください。
 

@@ -92,9 +92,9 @@ func NewService(repository Repository, client ChatClient, toolLoop *ToolLoop, cf
 	if err != nil {
 		return nil, err
 	}
-	systemPrompt := cfg.SystemPrompt
-	if strings.TrimSpace(systemPrompt) == "" {
-		systemPrompt = defaultSystemPrompt
+	systemPrompt := BuildSystemPrompt(toolLoop.profile, toolLoop.registry.LLMTools())
+	if strings.TrimSpace(cfg.SystemPrompt) != "" {
+		systemPrompt += "\n\n" + cfg.SystemPrompt
 	}
 	clock := cfg.Clock
 	if clock == nil {
