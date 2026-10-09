@@ -106,6 +106,7 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 | `REQUEST_QUEUE_SIZE` | `10` | Maximum number of queued Discord requests. |
 | `QUEUE_WAIT_TIMEOUT` | `180s` | Maximum time a request waits in the queue. |
 | `REQUEST_TIMEOUT` | `300s` | Maximum processing time for one request. |
+| `APP_TIMEZONE` | `Asia/Tokyo` | Timezone used for relative date and time answers. |
 | `DISCORD_REPLY_MAX_CHARS` | `1900` | Maximum characters per Discord reply chunk; must not exceed 2000. |
 | `DISCORD_SEND_MAX_RETRIES` | `3` | Maximum retry count for sending a reply. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error`. Unknown values use `info`. |
@@ -114,11 +115,15 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 
 Duration values use Go duration syntax such as `30s`, `5m`, or `168h`. Numeric environment limits must be positive integers. `DISCORD_SEND_MAX_RETRIES` accepts values from `1` through `10`.
 
+Relative date and time answers refer to the Discord message creation time in `APP_TIMEZONE`. The default is `Asia/Tokyo`; `UTC` and IANA names are allowed. `Local` and invalid names abort startup. Zii does not use web search for the date or time itself.
+
 ## Start in the foreground
 
 Run from the repository root. The process writes structured JSON logs to standard output. Press Ctrl+C to request graceful shutdown; Zii stops accepting new requests, drains active work, and closes its connections and database.
 
 Discord request and delivery failures retain their existing `event` and `error_code` fields and add an `error_detail` object. It contains a redacted `message`, `type`, and `cause_type`, plus `http_status`, `discord_code`, `cause_code` (for example, SQLite code 5), or `context_error` when available. Use `request_id` to correlate failures with processing and final-answer events; `processing_message_id` on `request_failed` is empty if no receipt was recorded. Discord still receives only the generic error text. Configured sensitive values and recognized sensitive patterns are redacted, Discord API response bodies are omitted, and diagnostic messages are limited to 2048 characters plus a truncation marker.
+
+With `LOG_LEVEL=DEBUG`, each Discord message HTTP attempt emits `event=discord_http_attempt`. `send_count` starts at 1 for each reply or edit and includes both DiscordGo internal retries and adapter retries. Correlate attempts with `request_id` and `delivery_id`; each chunk or edit has its own `delivery_id`. Logs include `operation`, `method`, `http_status`, `transport_error`, and `duration_ms`. `http_status=0` means no HTTP response was received. Headers, URLs, bodies, tokens, and error text are not logged. These records describe HTTP attempts, not proof that Discord created a message.
 
 For development, run directly from source:
 
@@ -197,3 +202,5 @@ go vet ./...
 The tests use fake LLM, MCP, and Discord clients; they do not contact your runtime services. For live startup, confirm that the LLM server has loaded the model named by `LLM_MODEL` and that Search MCP is reachable at `SEARCH_MCP_URL`. If Zii exits before connecting to Discord, check its first startup error and confirm the required environment variables, database directory permissions, and Search MCP tool list.
 
 In Discord, Zii responds when mentioned in a server channel and to ordinary text messages in a DM. It ignores bot, webhook, and system messages. The bot must be able to view and send messages in the target channel; replies are sent as replies to the triggering message.
+
+When a queued request starts, Zii atomically stores the question's Discord message ID and user message in SQLite before sending the processing receipt. Only the request that commits this registration sends a receipt and generates an answer. Duplicate questions and failed registrations do not send a processing receipt or call the LLM. Queued requests wait for their turn before receiving a receipt, keeping conversation history and answer delivery ordered. A committed question stays registered even if receipt delivery or later processing fails; retry by posting a new question. Receipt and error messages are not stored as conversation messages.

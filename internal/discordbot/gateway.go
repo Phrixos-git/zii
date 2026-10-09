@@ -3,6 +3,7 @@ package discordbot
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -37,6 +38,11 @@ func NewGateway(token string) (GatewayClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	base := session.Client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	session.Client.Transport = discordHTTPTransport{base: base}
 	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsDirectMessages
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Gateway{session: session, ctx: ctx, cancel: cancel}
@@ -89,8 +95,8 @@ func (g *Gateway) Sender() ReplySender { return discordSender{session: g.session
 
 type discordSender struct{ session *discordgo.Session }
 
-func (s discordSender) Reply(_ context.Context, replyTo, channelID, content string) (SentMessage, error) {
-	sent, err := s.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Content: content, Reference: &discordgo.MessageReference{MessageID: replyTo, ChannelID: channelID, FailIfNotExists: boolPointer(true)}, AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}}})
+func (s discordSender) Reply(ctx context.Context, replyTo, channelID, content string) (SentMessage, error) {
+	sent, err := s.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Content: content, Reference: &discordgo.MessageReference{MessageID: replyTo, ChannelID: channelID, FailIfNotExists: boolPointer(true)}, AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}}}, discordgo.WithContext(ctx))
 	if err != nil {
 		var rest *discordgo.RESTError
 		if errors.As(err, &rest) && rest.Response != nil {
@@ -102,8 +108,8 @@ func (s discordSender) Reply(_ context.Context, replyTo, channelID, content stri
 	return SentMessage{ID: sent.ID, CreatedAt: sent.Timestamp.UTC()}, nil
 }
 
-func (s discordSender) Edit(_ context.Context, channelID, messageID, content string) error {
-	_, err := s.session.ChannelMessageEdit(channelID, messageID, content)
+func (s discordSender) Edit(ctx context.Context, channelID, messageID, content string) error {
+	_, err := s.session.ChannelMessageEdit(channelID, messageID, content, discordgo.WithContext(ctx))
 	if err != nil {
 		var rest *discordgo.RESTError
 		if errors.As(err, &rest) && rest.Response != nil {

@@ -283,15 +283,18 @@ BotResponse
 - 決めたいこと：
     - 受付通知と最終回答をどう送信するか
 - 決定内容：
-    - Input Validation、Rate Limit、Duplicate / in-flight確認、Request Queue登録に成功した後、元User MessageへのReplyとして受付通知を送る。
+    - Input Validation、Rate Limit、in-flight確認、Request Queue登録に成功した後、会話単位の実行順を待つ。実行開始時にUser Messageと質問IDをSQLite Transactionで原子的に登録・Commitし、登録に成功した処理だけが元User Messageへの受付通知を送る。
     - 受付通知の本文は`質問を受け付けました。回答を生成しています。`とする。
-    - 受付通知の送信成功後にOrchestrator処理を開始する。受付通知はmessagesテーブルへ保存しない。
+    - 受付通知の送信成功後に履歴読み込みとLLM / MCP処理を開始する。重複登録やDB登録失敗では受付通知とLLM処理を行わない。受付通知はmessagesテーブルへ保存しない。
+    - Commitした質問は、受付通知送信や後続処理に失敗しても削除しない。同じ質問IDの再受信では再送せず、再試行は新しい質問Messageで行う。
     - 最終回答の先頭部分は受付通知をEditして表示する。
     - 受付後に処理またはOutput Validationが失敗した場合も、受付通知を安全なError MessageへEditする。
 
 ```
 User Message
     ↓
+Queue実行開始 → User Message原子登録・Commit
+    ↓ 登録成功した処理のみ
 Processing Reply
     ↓ Edit
 Final Answer
@@ -380,7 +383,7 @@ Final Answer
 - 決定内容：
     - Bot Adapter自身では短時間の**in-flight Message ID Set**を保持する。
     - 同一`discord_message_id`が処理中なら再投入しない。
-    - 永続的な重複判定はOrchestrator / SQLiteの：
+    - 永続的な重複判定は受付通知送信前の`BEGIN IMMEDIATE` Transaction内で行い、User Messageの登録・Commitに成功した処理だけが送信する。独立したSELECTによる事前確認には依存しない。SQLiteの：
 
 ```
 messages.discord_message_id UNIQUE
@@ -433,6 +436,10 @@ HTTP 5xx
 ```
 
 - Orchestrator側ではDiscord送信Retryを行わない。
+- `LOG_LEVEL=DEBUG`では、DiscordへのMessage送信・編集の各HTTP試行を`discord_http_attempt`として記録する。DiscordGo内部の再送もHTTP Transportで観測する。
+- `send_count`はReplyまたはEditごとに1から始め、Adapter再送とライブラリ内部再送を通算する。長文の各chunkと各Editは別の`delivery_id`を持ち、`request_id`で質問単位に関連付ける。
+- ログ項目は`request_id`、`delivery_id`、`operation`、`method`、`send_count`、`http_status`、`transport_error`、`duration_ms`。HTTP応答を取得できなければ`http_status=0`とする。本文、Header、URL、Token、エラー本文は記録しない。
+- HTTP試行回数はDiscord側でのMessage作成件数を保証しない。DiscordGoは502を内部再送するため、Adapterだけのログでは試行回数を把握できない。
 - 決定理由：
     - Discord Rate Limitとの二重制御を防げる。
 - 影響する項目：
