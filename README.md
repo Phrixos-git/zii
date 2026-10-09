@@ -2,6 +2,20 @@
 
 Zii is a Go Discord bot that stores per-user conversation history in SQLite, asks an OpenAI-compatible LLM for replies, and uses tools exposed by Search MCP.
 
+## Zii Ver1.2 identity and releases
+
+Zii is the Discord AI assistant. The selected LLM is its underlying model. Ver1.2 adds authoritative self-description, user-facing capabilities, and release information while retaining conversation, search, model selection, and evaluation behavior.
+
+Current capabilities include answering questions, writing and organizing information, using recent stored conversation history within configured limits and expiry, and explaining Zii's identity and releases. Search MCP is usable only when the selected profile enables Tools and the required tools are registered. Startup still requires Search MCP. Runtime availability describes configured support; network failures can still prevent searches. Recent conversation history is bounded and is not permanent User Memory.
+
+The single source is [`internal/identity/manifest.yaml`](internal/identity/manifest.yaml). Ver1.0 and Ver1.2 are `released` application versions; Ver1.5 (DeepSeek Harness / Agent), Ver2.0 (User Memory / Personalized Context), Ver2.5 (memory optimization), and Ver3.0 (visual output / image generation) are `planned`. Planned dates are undecided. The manifest describes this binary's functionality, not whether a branch has been merged or deployed.
+
+To update release information, edit that manifest, set `current_version` to a listed `released` version, and rebuild **both** `cmd/zii` and `cmd/zii-eval`. It is embedded in the binaries, requires no extra runtime file or environment variable, and does not reload while running. Unknown fields, malformed YAML, multiple documents, empty required fields, duplicate versions/capabilities/tools, unknown statuses, or an absent/planned current version cause startup to fail. Never put credentials, endpoints, database paths, or other private settings in the manifest.
+
+Discord and Eval share `orchestrator.BuildSystemPrompt`. The existing search and security policies are combined with the manifest and public runtime facts: the configured API model identifier and effective search availability. The identifier does not verify exact model weights or developer. Eval records the assembled prompt hash and each sample's actual prompt hash, including cases that disable tools. Updating the manifest therefore changes evaluation reproducibility information. `ServiceConfig.SystemPrompt`, when supplied by an internal caller, adds trusted instructions to the shared prompt rather than replacing it.
+
+Identity/release evaluation cases are in [`eval/testcases/identity.yaml`](eval/testcases/identity.yaml). See [`docs/ver1.2-implementation.md`](docs/ver1.2-implementation.md) for implementation decisions and validation results.
+
 ## Requirements
 
 - Go 1.25 or newer to build or run from source.
@@ -57,13 +71,15 @@ models:
       thinking_budget: true
       parallel_tool_calls: true
     supported_reasoning_efforts:
+      - low
       - medium
+      - xhigh
     defaults:
-      reasoning_effort: medium
+      reasoning_effort: xhigh
       thinking_budget_tokens: 2048
 ```
 
-The Qwen profile currently shipped in the active file enables all six capabilities. Its supported effort list contains `medium`, the value verified against the configured Qwen endpoint. Add other effort values only after confirming that the model and serving runtime accept them.
+The Qwen profile currently shipped in the active file enables all six capabilities. Its supported effort list contains `low`, `medium`, and `xhigh`, with `xhigh` as the current default. `medium` was previously verified against the configured Qwen endpoint. Add other effort values only after confirming that the model and serving runtime accept them.
 
 | Capability | Effect when enabled |
 | --- | --- |

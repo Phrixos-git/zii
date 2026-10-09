@@ -30,19 +30,20 @@ type RunOptions struct {
 	Label       string `json:"label"`
 }
 type Sample struct {
-	CaseID       string   `json:"case_id"`
-	Category     string   `json:"category"`
-	Repetition   int      `json:"repetition"`
-	Warmup       bool     `json:"warmup"`
-	Status       string   `json:"status"`
-	SkipReason   string   `json:"skip_reason,omitempty"`
-	FinalContent bool     `json:"final_content"`
-	FinalAnswer  string   `json:"final_answer,omitempty"`
-	ErrorCode    string   `json:"error_code,omitempty"`
-	Failures     []string `json:"failures,omitempty"`
-	Anomalies    []string `json:"anomalies,omitempty"`
-	Metrics      Metrics  `json:"metrics"`
-	Trace        Trace    `json:"trace"`
+	SystemPromptHash string   `json:"system_prompt_sha256,omitempty"`
+	CaseID           string   `json:"case_id"`
+	Category         string   `json:"category"`
+	Repetition       int      `json:"repetition"`
+	Warmup           bool     `json:"warmup"`
+	Status           string   `json:"status"`
+	SkipReason       string   `json:"skip_reason,omitempty"`
+	FinalContent     bool     `json:"final_content"`
+	FinalAnswer      string   `json:"final_answer,omitempty"`
+	ErrorCode        string   `json:"error_code,omitempty"`
+	Failures         []string `json:"failures,omitempty"`
+	Anomalies        []string `json:"anomalies,omitempty"`
+	Metrics          Metrics  `json:"metrics"`
+	Trace            Trace    `json:"trace"`
 }
 type Report struct {
 	Version          int               `json:"version"`
@@ -128,6 +129,7 @@ func Run(ctx context.Context, p Profile, s Suite, o RunOptions, progress func(Sa
 		return report, errors.New("Search MCP tool registry is invalid")
 	}
 	report.ToolSchemaHash = hash(registry.Tools())
+	report.SystemPromptHash = hash(orchestrator.BuildSystemPrompt(*p.ResolvedModelProfile, registry.LLMTools()))
 	report.ProtocolHash = hash(struct {
 		Mode, Counter, Timeout, MCPTimeout   string
 		Max, Local, Web, Fetch, Runs, Warmup int
@@ -216,7 +218,9 @@ func runSample(parent context.Context, p Profile, c Case, registry *searchmcp.Re
 		s.ErrorCode = "loop_config_error"
 		return s
 	}
-	messages := []chat.Message{{Role: "system", Content: orchestrator.DefaultSystemPrompt()}}
+	prompt := orchestrator.BuildSystemPrompt(client.ModelProfile(), reg.LLMTools())
+	s.SystemPromptHash = hash(prompt)
+	messages := []chat.Message{{Role: "system", Content: prompt}}
 	for _, h := range c.History {
 		messages = append(messages, chat.Message{Role: h.Role, Content: h.Content})
 	}

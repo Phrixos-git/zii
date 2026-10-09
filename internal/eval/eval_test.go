@@ -440,8 +440,8 @@ func TestYAMLValidationAndShippedCases(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if len(s.Cases) != 23 {
-		t.Fatalf("expected 23 shipped cases, got %d", len(s.Cases))
+	if len(s.Cases) != 43 {
+		t.Fatalf("expected 43 shipped cases, got %d", len(s.Cases))
 	}
 	p, e := LoadProfile("../../eval/profiles/example.yaml")
 	if e != nil {
@@ -450,7 +450,11 @@ func TestYAMLValidationAndShippedCases(t *testing.T) {
 	if p.ToolMode != "fixture" {
 		t.Fatal(p)
 	}
-	if p.ResolvedModelProfile == nil || p.ModelProfileID != "qwen" || !p.ResolvedModelProfile.Capabilities.ParallelToolCalls || p.ResolvedModelProfile.Defaults.ReasoningEffort != "medium" {
+	expected, err := llm.LoadModelProfile("../../config/model_profiles.yaml", "qwen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ResolvedModelProfile == nil || p.ModelProfileID != "qwen" || !reflect.DeepEqual(*p.ResolvedModelProfile, expected) {
 		t.Fatalf("production model profile was not resolved: %+v", p)
 	}
 	for name, body := range map[string]string{
