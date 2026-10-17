@@ -3,7 +3,7 @@ type: consultation
 project:
 status: open
 created: "2026-09-16"
-updated: "2026-09-23"
+updated: "2026-10-17"
 tags: []
 ---
 
@@ -436,6 +436,8 @@ LIMIT 1
 
 ```
 System Prompt
+  Ziiのmanifest・モデルとToolの利用可否（OR-19 / OR-20）
+  質問Messageの作成日時に基づく日時情報（OR-21）
 ↓
 過去Conversation履歴
   最大5ターン
@@ -467,7 +469,7 @@ LLM再推論
 - Tool Result全体は既存設計どおり概ね24K tokens以内を上限とする。
 	- Tool Context全体 = 24K
 		fetch_page最大 = 8K / page
-		ただし3ページすべて8K使えるとは保証しない
+		ただし各ページで8K使えるとは保証しない
 		残りTool Context Budgetに応じて切り詰める
 - 決定理由：
     - モデルと異なるTokenizerによる誤差を避けられる。
@@ -494,26 +496,26 @@ LLM再推論
     - `/v1/chat/completions`
     - `/v1/responses`
 - 決定内容：
-    - 初期実装はOpenAI互換：
+    - OpenAI互換のChat Completions APIを使用する。
 
-```
-POST http://127.0.0.1:8080/v1/chat/completions
+```text
+POST <選択したモデルプロファイルのendpoint>/v1/chat/completions
 ```
 
-- Model名はコード固定せず`LLM_MODEL`環境変数。
-- 初期Request：
+- `LLM_MODEL`はOR-19のYAMLプロファイルを選ぶキーとする。APIへ送るModel名と接続先は、選択したプロファイルの`model`と`endpoint`を使用する。
+- Requestの基本設定は以下とし、Tool関連の項目はOR-19のCapabilityに従って送信する。
 
 ```
 stream: false
 max_tokens: 4096
 tool_choice: auto
-parallel_tool_calls: false
+parallel_tool_calls: <選択したプロファイルの設定値>
 ```
 
-- 通常の初回RequestではSampling系をOrchestratorから上書きせず、llama.cpp / Model側の設定を利用する。
-- OR-13で定義する`finish_reason=length`後の短縮再試行に限り、再試行単位の生成設定で上書きする。通常RequestやClient共通設定は変更しない。
+- 通常RequestのSampling系はLLMサーバー側の設定を利用する。`reasoning_effort`と`thinking_budget_tokens`は、選択したモデルプロファイルの既定値と環境変数に従う。対応しない項目は送信しない。
+- OR-13で定義する最終回答の再試行では、再試行単位の生成設定で上書きする。通常RequestやClient共通設定は変更しない。
 - Function CallingはOpenAI形式の`tools`を使用する。
-- llama.cppでは`--jinja`とTool対応Chat TemplateによるOpenAI-style Function Callingがサポートされている。Parallel Tool Callingは明示的に有効化可能だが、初期版では無効にする。
+- llama.cppを使用する場合はTool対応Chat Templateを使用する。複数Tool Callの受理は、選択したプロファイルの`parallel_tool_calls`に従う。Orchestrator内の実行は逐次とする。
 - `finish_reason`：
 
 ```
@@ -536,7 +538,7 @@ null / unknown
 - OpenAI互換ではArgumentsはJSON文字列を基本とするが、llama.cppのバージョン差への耐性としてJSON Objectで返ってきた場合も正規化して受理できるようにする。現在もArguments型に関する互換性問題の報告があるため。
 - 決定理由：
     - llama.cppで成熟しているAPIをそのまま使える。
-    - 初期版でStreamingやParallel Tool Callを入れないことでLoop制御が単純。
+    - Streamingは使用せず、Toolの実行順をOrchestratorで制御する。
 - 影響する項目：
     - OR-03
     - OR-07
@@ -676,7 +678,7 @@ tool(tool_call_id + result)
 LLM再推論
 ```
 
-- `parallel_tool_calls=false`として1回に1 Toolを処理。
+- `parallel_tool_calls=false`のプロファイルでは、1 Response内の複数Tool Callをエラーにする。`true`の場合は複数Tool Callを受理し、返された順に1 Toolずつ検証・実行する。各Callに回数上限を適用する。
 - Allowlist外Toolは実行しない。
 - Schema不正ArgumentsもMCPへ送信しない。
 - 不正Tool Callは、SanitizeしたTool ErrorとしてLLMへ1度返し自己修正を許可する。
@@ -764,21 +766,22 @@ search_web
 ```
 1 User Requestあたり
 
-最大Tool Call: 7回
+最大Tool Call: 3回
 
 search_local:
     最大2回
 
 search_web:
-    最大2回
+    最大1回
 
 fetch_page:
-    最大3回
+    最大2回
 ```
 
+- 上記はBot起動時の既定値とする。各Toolの上限内でも、合計3回を超えて実行しない。環境変数で変更する場合はOR-15に従う。
 - fetch_pageは1ページ最大8K tokensとするが、
 	Tool Result全体24K tokensを超えない範囲で利用する。
-	3ページすべてが8K tokens利用できるとは限らない。
+	各ページで8K tokens利用できるとは限らない。
 - 同じTool + 同じ正規化Argumentsを同一Request内で繰り返し実行しない。
 - 終了条件：
 
@@ -796,6 +799,7 @@ Context Budget不足
 
 - 上限到達時はToolを追加実行せず、LLMへ「これ以上Toolを使用できない」状態を渡し、保持済み情報から最終回答を生成させる。
 - 決定理由：
+    - 当初の設計値でテストした際、Tool CallでContextを使い果たし、応答を返せないことがあったため、合計3回・`search_web`1回・`fetch_page`2回を正式な既定値とした。
     - 無限Loop防止。
     - 64K Contextの保護。
 - 影響する項目：
@@ -804,7 +808,8 @@ Context Budget不足
 - 残課題：
     - なし
 - 確認方法：
-    - 意図的にTool Loopさせても7回以内で終了すること。
+    - 既定設定でMCPへのTool実行が合計3回以内、`search_local`2回以内、`search_web`1回以内、`fetch_page`2回以内になること。
+    - 上限到達後はToolを追加実行せず、保持済み情報で最終回答を生成すること。
 
 ---
 
@@ -984,7 +989,7 @@ thinking_budget_tokens = 2048
 max_tokens = 1536
 ```
 
-- 通常Requestは既定の`max_tokens=4096`を使い、`reasoning_effort`と`thinking_budget_tokens`を送らない。
+- 通常Requestは既定の`max_tokens=4096`を使う。`reasoning_effort`と`thinking_budget_tokens`の通常値はOR-19に従い、再試行時の上書きもモデルのCapabilityで許可された項目だけを送信する。
 - Discord AdapterはOrchestratorの検出を通過した後も、最終出力にtool-call記法が残っていないか送信・保存前に検査する。一致した場合は最終回答を配信・SQLite保存せず、既定のエラー応答にする。
 - Request Queueへの登録成功後、会話単位の実行順を待つ。実行開始時にUser Messageと質問IDをSQLiteへ原子的に登録・Commitし、成功した処理だけが元User MessageへのProcessing Replyを送る。重複・DB登録失敗ではProcessing ReplyとLLM処理を行わない。送信に失敗した場合もLLM処理を開始しない。
 - Commit済みUser Messageは後続処理の失敗でも削除しない。同じ質問IDの再受信は無視し、再試行は新しい質問Messageで行う。
@@ -1100,8 +1105,8 @@ COMMIT
 - 決定内容：
 
 ```
-LLM_BASE_URL=http://127.0.0.1:8080
-LLM_MODEL=<llama-server alias>
+LLM_PROFILE_CONFIG=config/model_profiles.yaml
+LLM_MODEL=<モデルプロファイルのキー>
 LLM_TIMEOUT=180s
 LLM_MAX_TOKENS=4096
 LLM_MAX_CONCURRENCY=2
@@ -1111,15 +1116,16 @@ SEARCH_MCP_TIMEOUT=30s
 MCP_MAX_CONCURRENCY=4
 
 BOT_DB_PATH=<absolute path>/bot.db
+APP_TIMEZONE=Asia/Tokyo
 
 CONVERSATION_TTL=168h
 CONVERSATION_MAX_TURNS=5
 CONVERSATION_MAX_TOKENS=8192
 
-TOOL_MAX_CALLS=7
+TOOL_MAX_CALLS=3
 SEARCH_LOCAL_MAX_CALLS=2
-SEARCH_WEB_MAX_CALLS=2
-FETCH_PAGE_MAX_CALLS=3
+SEARCH_WEB_MAX_CALLS=1
+FETCH_PAGE_MAX_CALLS=2
 
 REQUEST_QUEUE_SIZE=10
 QUEUE_WAIT_TIMEOUT=180s
@@ -1128,6 +1134,10 @@ REQUEST_TIMEOUT=300s
 LOG_LEVEL=info
 ```
 
+- `LLM_MODEL`は必須。モデルと接続先の定義、Capability、通常の推論設定はOR-19に従う。
+- `LLM_REASONING_EFFORT`と`LLM_THINKING_BUDGET_TOKENS`は任意の上書き設定とする。
+- `LLM_BASE_URL`は接続先の選択に使用しない。選択したプロファイルの`endpoint`が接続先となり、異なる値が設定されていれば警告を記録する。
+- `APP_TIMEZONE`はOR-21の日時情報に使用する。未設定時は`Asia/Tokyo`とする。
 - DB Pathは`~`をApplication側で曖昧に解釈させず、Launcherから絶対Pathを渡す。
 - Secretは別管理。
 - Discord Token等はこの通常設定一覧に含めない。
@@ -1138,7 +1148,7 @@ LOG_LEVEL=info
 - 残課題：
     - Secret管理方式はDiscord Bot deployment側で確定。
 - 確認方法：
-    - 環境変数変更だけでEndpoint / Timeout / Limit変更可能。
+    - モデルプロファイルの切替でModel / Endpointが変わり、環境変数でTimeout / Limitを変更できる。
 
 ---
 
@@ -1532,6 +1542,143 @@ LLM最終回答をDiscordへ送信する前に、
     安全なError Replyへ置換
 
 これが**Agentic Prompt Injectionの被害を限定する重要な境界**です。
+
+---
+
+## OR-19：モデルプロファイル
+
+- 状態：**決定**
+- 決めたいこと：
+    - 複数モデルの接続先、APIへ送るModel名、対応機能と推論設定の管理方法
+- 決定内容：
+    - `config/model_profiles.yaml`を既定の設定ファイルとし、`LLM_PROFILE_CONFIG`で別のファイルを指定できる。
+    - `LLM_MODEL`で`models`配下のキーを選択する。プロファイルのキーとAPIへ送る`model`は区別する。
+    - 各プロファイルは以下を持つ。
+
+```text
+models.<プロファイルのキー>
+├─ model
+├─ endpoint
+├─ capabilities
+│   ├─ tools
+│   ├─ reasoning
+│   ├─ reasoning_content
+│   ├─ reasoning_effort
+│   ├─ thinking_budget
+│   └─ parallel_tool_calls
+├─ supported_reasoning_efforts
+└─ defaults
+    ├─ reasoning_effort
+    └─ thinking_budget_tokens
+```
+
+- `endpoint`はHTTP / HTTPSの絶対URLとし、認証情報・Query・Fragmentを含めない。
+- Capabilityの6項目、`supported_reasoning_efforts`、既定値の2項目は明示する。未対応の推論設定は空文字・空配列・`null`で表す。
+- 未知の項目、必須項目の欠落、不正値、存在しないプロファイルの指定は起動エラーとする。
+- 通常の推論設定はプロファイルの既定値を使い、`LLM_REASONING_EFFORT`と`LLM_THINKING_BUDGET_TOKENS`で上書きできる。Thinking Budgetの未指定または`0`は、プロファイルの既定値を使う。
+- `reasoning_effort`は対応値を検証する。推論設定は`reasoning`と対応するCapabilityが有効な場合だけ送信する。
+- `tools=false`ではTool定義、`tool_choice`、`parallel_tool_calls`を送信せず、Tool Call応答も受理しない。
+- `reasoning_content=false`では推論本文を送受信のMessageに残さない。推論本文を最終回答の代用にしない。
+- 複数Tool Callの受理と逐次実行はOR-07、最終回答の再試行はOR-13に従う。
+- 決定理由：
+    - 当初はQwenのみを想定していたが、後から他のモデルでも比較できるようにするため追加した。
+- 影響する項目：
+    - OR-04
+    - OR-07
+    - OR-13
+    - OR-15
+    - OR-22
+- 残課題：
+    - モデル追加時はそのモデルとサーバーの対応機能を確認してプロファイルへ反映する。
+- 確認方法：
+    - プロファイルのキーとAPIのModel名が異なる場合も、指定したModel名・接続先へ送信される。
+    - 未対応の推論設定やTool関連項目がRequestへ入らない。
+    - 設定の欠落・不正値・未知のキーで起動に失敗する。
+
+---
+
+## OR-20：Ziiの自己紹介・機能・リリース情報
+
+- 状態：**決定**
+- 決めたいこと：
+    - Ziiと基盤モデルを区別し、提供機能とリリース情報を回答する方法
+- 決定内容：
+    - `internal/identity/manifest.yaml`をZiiの公開情報の管理元とし、実行ファイルへ埋め込む。
+    - manifestは以下を持つ。
+
+```text
+name
+role
+description
+current_version
+capabilities
+  id / description / requires_tools
+releases
+  version / status / summary
+```
+
+- 起動時にmanifestを検証する。必須情報の欠落、機能ID・バージョンの重複、不正なリリース状態などはエラーとする。
+- 現在のバージョンは`releases`に存在し、`released`であることを必須とする。`planned`は今後の予定として扱い、現在使える機能として説明しない。
+- `BuildSystemPrompt`でmanifestをSystem Promptへ付与する。自己紹介・機能・リリース情報の質問は、この情報を使って回答し、外部検索しない。
+- Search機能の利用可否は、モデルの`tools` Capabilityと、その機能が必要とするToolの公開状況から付与する。設定上の利用可否は、実際の通信成功を保証しない。
+- 基盤モデルのAPI識別子はZiiの名称・提供機能と区別する。基盤モデルを明示的に聞かれた場合に説明し、識別子だけから開発元や重みを推測しない。
+- User入力、過去の回答、検索結果ではmanifestを上書きできない。予定機能や未知のバージョン、未定のリリース日を作らない。
+- 通常の技術質問では不要な自己紹介を付けない。期限と上限のある会話履歴を永続的なUser Memoryとして説明しない。
+- 決定理由：
+    - Ziiに「あなたは何ができるの？」と質問した際に、Qwenモデルの紹介文が返ってきたため、Zii自身の情報を管理する仕組みを追加した。
+- 影響する項目：
+    - OR-03
+    - OR-18
+    - OR-19
+    - OR-22
+- 残課題：
+    - なし
+- 確認方法：
+    - 基盤モデルを切り替えてもZiiとして自己紹介する。
+    - 検索の利用可否、実装済み機能と予定機能を区別する。
+    - User入力や検索結果に矛盾する自己紹介があっても、manifestの情報を使用する。
+
+---
+
+## OR-21：質問Messageを基準とする日時情報
+
+- 状態：**決定**
+- 決めたいこと：
+    - RequestごとにSystem側へ渡す日時情報と、その基準時刻
+- 決定内容：
+    - `BotRequest.message_created_at`を`APP_TIMEZONE`へ変換し、基準日時・タイムゾーン・日付・曜日をSystem Promptへ付与する。
+    - 日時情報はUser本文へ混ぜず、OR-03の先頭のSystem Messageへ追加する。
+    - `APP_TIMEZONE`の既定値は`Asia/Tokyo`とする。UTCまたはIANAのタイムゾーン名を受理し、不正な名前とホスト依存の`Local`は起動エラーとする。
+    - 日時情報の生成には`received_at`や処理開始時の`time.Now()`を使用しない。Queue待機やTool処理で時間が経過しても、質問Messageの作成日時を基準とする。
+    - 現在のSystem Promptでは、「今日」「明日」「昨日」などの相対日付も、この日時情報を使って解釈する。
+    - User入力、過去履歴、Tool Resultによって実際の基準日時を上書きしない。日時情報だけを得るための検索は行わない。
+    - 日時情報が欠落・不正な場合は現在日時を推測しない。Requestの`message_created_at`が未設定の場合は入力検証で拒否する。
+    - この日時情報はRequestごとに生成し、System MessageとしてSQLiteへ保存しない。
+- 決定理由：
+    - デバッグに使用するため、質問Messageの作成日時をSystem側へ渡す仕組みを追加した。
+- 影響する項目：
+    - Discord Bot設計 DB-04
+    - OR-03
+    - OR-08
+    - OR-15
+    - OR-18
+- 残課題：
+    - なし
+- 確認方法：
+    - UTCから`Asia/Tokyo`への日付の切替、曜日、別タイムゾーンへの変換を確認する。
+    - Queue待機後も質問Messageの作成日時が基準になる。
+    - User本文・過去履歴・Tool Resultの日時指定が、実際の基準日時を変えない。
+
+---
+
+## OR-22：モデル比較用Evaluation CLI
+
+- 状態：**決定**
+- 決定内容：
+    - モデル比較用CLI `zii-eval`の詳細は、[zii-eval設計](zii-eval設計.md)に記載する。
+    - 本番と共有するLLM Client、Tool Calling Loop、モデルプロファイル、System Promptは、本設計のOR-04 / OR-07 / OR-19 / OR-20に従う。
+
+---
 
 ## リスク
 
