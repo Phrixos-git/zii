@@ -1,5 +1,7 @@
 # Zii
 
+[日本語](README_jp.md)
+
 Zii is a Go Discord bot that stores per-user conversation history in SQLite, asks an OpenAI-compatible LLM for replies, and uses tools exposed by Search MCP.
 
 ## Zii Ver1.2 identity and releases
@@ -21,7 +23,7 @@ Identity/release evaluation cases are in [`eval/testcases/identity.yaml`](eval/t
 - Go 1.25 or newer to build or run from source.
 - A Discord application and bot token. Enable the `Guilds`, `Guild Messages`, and `Direct Messages` Gateway intents. Zii does not request the privileged Message Content intent.
 - Invite the bot with permission to view channels, send messages, send messages in threads, and read message history.
-- An OpenAI-compatible LLM server with the selected model loaded and a Chat Completions endpoint. The endpoint is configured by the selected Model Profile. Tool calling is used only when that profile enables the `tools` capability.
+- An OpenAI-compatible LLM server with the selected model loaded, `POST /v1/chat/completions`, and `POST /v1/chat/completions/input_tokens`. Zii uses the latter to count history and tool-result tokens with the active model/template and does not fall back to estimates in the bot. The endpoint is configured by the selected Model Profile. Tool calling is used only when that profile enables the `tools` capability.
 - Search MCP serving Streamable HTTP and providing the tools Zii uses (`search_local`, `search_web`, and `fetch_page`). The default endpoint is `http://127.0.0.1:8081/mcp`.
 - A writable directory for the SQLite database. The database path must be absolute, and its parent directory must already exist.
 
@@ -52,7 +54,7 @@ mkdir -p /absolute/path/to/zii/data
 
 Model IDs, LLM endpoints, capabilities, supported reasoning efforts, and generation defaults are configured in `config/model_profiles.yaml`. `LLM_MODEL` selects a key under `models:`; the profile's `model` value is sent to the API as the model name. Add or edit a profile there when changing the model or its endpoint. `.env` is excluded from Git and is not loaded automatically by Zii. The commands below export its values into the current shell before launch. Do not commit or share `.env`; it contains the Discord bot token. The legacy `LLM_BASE_URL` variable is ignored; the selected YAML profile endpoint is authoritative. If the legacy variable is set to a different endpoint, Zii logs a warning.
 
-`config/gpt-oss-20b.profile.example.yaml` shows how to add another profile. It is an example and is not loaded automatically. Its endpoint is a placeholder and must be replaced with the actual server address before selecting it. Profile effort and capability values must be checked against the target model/runtime.
+`config/gpt-oss-20b.profile.example.yaml` shows how to add another profile. It is an example and is not loaded automatically. Its endpoint is a local example address and must match your server before selecting it. The active file already includes `gpt-oss-20b`; the example has separate defaults and does not override the active entry. Profile effort and capability values must be checked against the target model/runtime.
 
 ### Model Profiles and capabilities
 
@@ -79,7 +81,7 @@ models:
       thinking_budget_tokens: 2048
 ```
 
-The Qwen profile currently shipped in the active file enables all six capabilities. Its supported effort list contains `low`, `medium`, and `xhigh`, with `xhigh` as the current default. `medium` was previously verified against the configured Qwen endpoint. Add other effort values only after confirming that the model and serving runtime accept them.
+The Qwen profile currently shipped in the active file enables all six capabilities. Its supported effort list contains `low`, `medium`, and `xhigh`, with `xhigh` as the current default. These values declare the configuration supported by Zii; they are not a live check of the server. Confirm that the target model and serving runtime accept the configured values.
 
 | Capability | Effect when enabled |
 | --- | --- |
@@ -90,9 +92,9 @@ The Qwen profile currently shipped in the active file enables all six capabiliti
 | `thinking_budget` | Allows `thinking_budget_tokens` to be sent. This is independent of `reasoning_effort`. |
 | `parallel_tool_calls` | Allows the request to accept multiple tool calls in one assistant response. Zii uses its existing tool-call handling; this setting does not add a parallel execution engine. |
 
-Capability flags control whether a feature or request field may be used; they do not supply its value. A reasoning field whose capability is disabled is omitted from the API request. An effort value that is not listed in `supported_reasoning_efforts` is rejected. Capability flags and other profile fields are validated at startup: invalid YAML, unknown fields, incomplete profiles, and an unknown `LLM_MODEL` cause startup to fail rather than being silently corrected.
+Capability flags control whether a feature or request field may be used; they do not supply its value. A reasoning field whose capability is disabled is omitted from the API request. When the `reasoning_effort` capability is enabled, an effort value that is not listed in `supported_reasoning_efforts` is rejected. Capability flags and other profile fields are validated at startup: invalid YAML, unknown fields, incomplete profiles, and an unknown `LLM_MODEL` cause startup to fail rather than being silently corrected.
 
-To add a model without changing or rebuilding Go code, copy the `gpt-oss-20b` entry from `config/gpt-oss-20b.profile.example.yaml` into the active file's `models:` mapping. Set its real endpoint and API model name, and confirm its capabilities, supported effort values, and defaults against that model/runtime. Then set `LLM_MODEL` to the profile key (for example, `gpt-oss-20b`) and restart Zii. To use another profile file, set `LLM_PROFILE_CONFIG`; relative paths are resolved from the process working directory.
+The active file already includes `qwen`, `gpt-oss-20b`, and `ministral-3-14b-instruct-2512`. Select an existing profile with `LLM_MODEL` after checking its endpoint. To add a different model without changing or rebuilding Go code, use `config/gpt-oss-20b.profile.example.yaml` as a template and add an entry with a new key under `models:`; do not duplicate an existing key. Set its real endpoint and API model name, and confirm its capabilities, supported effort values, and defaults against that model/runtime. Then set `LLM_MODEL` to the chosen profile key and restart Zii. To use another profile file, set `LLM_PROFILE_CONFIG`; relative paths are resolved from the process working directory.
 
 ### Environment settings
 
@@ -112,26 +114,26 @@ All settings can be left at the defaults shown in `.env.example`, except the thr
 | `SEARCH_MCP_URL` | `http://127.0.0.1:8081/mcp` | Search MCP Streamable HTTP endpoint. |
 | `SEARCH_MCP_TIMEOUT` | `30s` | Search MCP request timeout. |
 | `MCP_MAX_CONCURRENCY` | `4` | Maximum concurrent Search MCP calls. |
-| `CONVERSATION_TTL` | `168h` | Conversation retention duration. |
-| `CONVERSATION_MAX_TURNS` | `5` | Maximum prior conversation turns included in context. |
-| `CONVERSATION_MAX_TOKENS` | `8192` | Token budget for conversation history. |
+| `CONVERSATION_TTL` | `168h` | Inactivity period before starting a new conversation. Expiry does not delete stored data. |
+| `CONVERSATION_MAX_TURNS` | `5` | Maximum complete prior user/assistant turns included in context; allowed range: 1–5. |
+| `CONVERSATION_MAX_TOKENS` | `8192` | Token budget for prior history only; allowed range: 1–8192. |
 | `TOOL_MAX_CALLS` | `3` | Maximum tool calls for one user request. |
 | `SEARCH_LOCAL_MAX_CALLS` | `2` | Maximum `search_local` calls per request. |
 | `SEARCH_WEB_MAX_CALLS` | `1` | Maximum `search_web` calls per request. |
 | `FETCH_PAGE_MAX_CALLS` | `2` | Maximum `fetch_page` calls per request. |
 | `REQUEST_QUEUE_SIZE` | `10` | Maximum number of queued Discord requests. |
 | `QUEUE_WAIT_TIMEOUT` | `180s` | Maximum time a request waits in the queue. |
-| `REQUEST_TIMEOUT` | `300s` | Maximum processing time for one request. |
+| `REQUEST_TIMEOUT` | `300s` | Total request timeout, including queue wait and reply delivery. |
 | `APP_TIMEZONE` | `Asia/Tokyo` | Timezone used for relative date and time answers. |
 | `DISCORD_REPLY_MAX_CHARS` | `1900` | Maximum characters per Discord reply chunk; must not exceed 2000. |
-| `DISCORD_SEND_MAX_RETRIES` | `3` | Maximum retry count for sending a reply. |
+| `DISCORD_SEND_MAX_RETRIES` | `3` | Adapter retry limit for sending or editing a reply; DiscordGo may also retry internally. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error`. Unknown values use `info`. |
 
-`LLM_REASONING_EFFORT` and `LLM_THINKING_BUDGET_TOKENS` optionally override the selected profile's defaults. An effort value must appear in that profile's `supported_reasoning_efforts` list. A zero budget means “use the profile default”; set the YAML value to `null` for no default budget. Each value is sent only when both `reasoning` and its corresponding `reasoning_effort` or `thinking_budget` capability are enabled. A disabled capability causes the field to be omitted even when an environment override or profile default is present.
+`LLM_REASONING_EFFORT` and `LLM_THINKING_BUDGET_TOKENS` optionally override the selected profile's defaults. When the profile enables `reasoning_effort`, an effort value must appear in its `supported_reasoning_efforts` list. A zero budget means “use the profile default”; set the YAML value to `null` for no default budget. Each value is sent only when both `reasoning` and its corresponding `reasoning_effort` or `thinking_budget` capability are enabled. A disabled capability causes the field to be omitted even when an environment override or profile default is present.
 
-Duration values use Go duration syntax such as `30s`, `5m`, or `168h`. Numeric environment limits must be positive integers. `DISCORD_SEND_MAX_RETRIES` accepts values from `1` through `10`.
+Duration values use Go duration syntax such as `30s`, `5m`, or `168h`. Numeric environment limits must be positive integers, except `LLM_THINKING_BUDGET_TOKENS`, which also accepts `0`. Conversation history limits and the reply chunk size must also stay within the ranges above. `DISCORD_SEND_MAX_RETRIES` accepts values from `1` through `10`.
 
-Relative date and time answers refer to the Discord message creation time in `APP_TIMEZONE`. The default is `Asia/Tokyo`; `UTC` and IANA names are allowed. `Local` and invalid names abort startup. Zii does not use web search for the date or time itself.
+Relative date and time answers refer to the Discord message creation time in `APP_TIMEZONE`. Zii adds that time, timezone, date, and weekday to the system message for each request; queue delays do not change the reference time. The default is `Asia/Tokyo`; `UTC` and IANA names are allowed. `Local` and invalid names abort startup. Zii does not use web search for the date or time itself.
 
 ## Start in the foreground
 
@@ -203,8 +205,11 @@ Zii handles `SIGTERM` and allows up to 60 seconds for in-flight requests and the
 YAML question sets through the production ToolLoop without Discord or the
 conversation database, records anomalies and timings, and writes JSON, CSV,
 and Markdown reports. Use fixed tool responses for repeatable comparisons or
-live Search MCP for integration checks. See [eval/README.md](eval/README.md)
-for profiles, warmup/repetitions, metrics, and the `compare` command.
+live Search MCP for integration checks. Fixture mode still calls the real LLM.
+The CLI does not add Discord message timestamps to the prompt. See
+[eval/README.md](eval/README.md) for profiles, warmup/repetitions, metrics, and
+the `compare` command, and [the evaluation design](design/zii-eval設計.md)
+for its responsibilities and contracts.
 
 ### Application checks
 
@@ -215,8 +220,22 @@ go test ./...
 go vet ./...
 ```
 
-The tests use fake LLM, MCP, and Discord clients; they do not contact your runtime services. For live startup, confirm that the LLM server has loaded the model named by `LLM_MODEL` and that Search MCP is reachable at `SEARCH_MCP_URL`. If Zii exits before connecting to Discord, check its first startup error and confirm the required environment variables, database directory permissions, and Search MCP tool list.
+The tests use fake clients and local HTTP/MCP test servers; they do not verify your running LLM, Search MCP, or Discord deployment. For live startup, confirm that the LLM server at the selected profile's `endpoint` has loaded that profile's `model`, supports the required token-count endpoint, and that Search MCP is reachable at `SEARCH_MCP_URL`. `LLM_MODEL` is the profile key, not necessarily the API model name. The executable logs startup/shutdown failures as `event=fatal` with `error_code=startup_or_shutdown_error`; it does not log the returned error text. If startup fails, verify the required environment variables, profile YAML, timezone, database directory permissions, and Search MCP tool list.
 
 In Discord, Zii responds when mentioned in a server channel and to ordinary text messages in a DM. It ignores bot, webhook, and system messages. The bot must be able to view and send messages in the target channel; replies are sent as replies to the triggering message.
 
 When a queued request starts, Zii atomically stores the question's Discord message ID and user message in SQLite before sending the processing receipt. Only the request that commits this registration sends a receipt and generates an answer. Duplicate questions and failed registrations do not send a processing receipt or call the LLM. Queued requests wait for their turn before receiving a receipt, keeping conversation history and answer delivery ordered. A committed question stays registered even if receipt delivery or later processing fails; retry by posting a new question. Receipt and error messages are not stored as conversation messages.
+
+The first final-answer chunk replaces the processing receipt by editing it. Further chunks are replies to the original question. Only after all chunks are delivered does Zii store the complete assistant answer, using the receipt's Discord message ID and creation time as the representative message. Partial delivery does not store an assistant turn. Final output is checked for tool-call syntax and sensitive information before delivery and storage; blocked output is replaced with a generic error response when possible.
+
+Only normalized text is accepted: up to 4,000 Unicode code points, with invalid UTF-8 rejected and most control characters removed. Attachments alone are not processed. A per-user rate limiter allows five requests per minute with a burst of two; requests over the limit are ignored. Conversation keys include the guild (or DM), channel/thread, and user. The context includes complete prior turns only, up to the configured history limits; expired conversations remain in SQLite and a new conversation is started.
+
+If a generation reaches its output limit or returns tool-call syntax as answer text, Zii shares a single final-answer recovery attempt between these conditions. It compacts existing tool results to at most 4,096 tokens, disables further tools, and requests a shorter answer with `max_tokens=1536`. Reasoning overrides (`medium`, 2,048 thinking tokens) are sent only when the profile supports them. Empty final answers fail; reasoning text is not used as the answer.
+
+## Design documents
+
+- [Discord Bot](design/zii_Discord_BOT設計.md)
+- [Orchestrator](design/zii_Discord_Bot_Orchestrator設計.md)
+- [Conversations table](design/zii_conversations_テーブル.md)
+- [Messages table](design/zii_messages_テーブル.md)
+- [zii-eval](design/zii-eval設計.md)
